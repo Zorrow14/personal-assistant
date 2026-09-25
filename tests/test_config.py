@@ -47,6 +47,28 @@ def test_defaults() -> None:
     assert settings.auto_index is True
 
 
+def test_tool_settings_defaults() -> None:
+    settings = _settings()
+    assert settings.enabled_tools is None
+    assert settings.confirm_side_effects is True
+    assert settings.search_max_results == 5
+    assert settings.reminders_path == Path(".jarvis/reminders.json")
+    assert settings.file_sandbox_root is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("web_search, get_datetime", ["web_search", "get_datetime"]),
+        ('["web_search","set_reminder"]', ["web_search", "set_reminder"]),
+        ("search_memory", ["search_memory"]),
+    ],
+)
+def test_enabled_tools_from_env(monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]) -> None:
+    monkeypatch.setenv("JARVIS_ENABLED_TOOLS", raw)
+    assert _settings().enabled_tools == expected
+
+
 def test_chunk_overlap_must_be_smaller_than_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JARVIS_RAG_CHUNK_CHARS", "200")
     monkeypatch.setenv("JARVIS_RAG_CHUNK_OVERLAP", "200")

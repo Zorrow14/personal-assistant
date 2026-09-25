@@ -5,6 +5,7 @@ agent never knows which LLM provider it is talking to.
 """
 
 import json
+import textwrap
 from collections.abc import Callable
 
 from pydantic import ValidationError
@@ -22,12 +23,23 @@ ConfirmFn = Callable[[ToolCall], bool]
 log = get_logger(__name__)
 
 
-def confirm_on_cli(call: ToolCall) -> bool:
-    """Show a pending tool call and ask the user y/N on the terminal."""
+def confirm_on_cli(call: ToolCall, *, category: str = "general") -> bool:
+    """Show a pending side-effect action unmistakably and ask the user y/N on the terminal.
+
+    Anything but an explicit "y"/"yes" (including Enter, EOF) declines.
+    """
     args = json.dumps(call.input, indent=2, ensure_ascii=False)
-    print(f"\nJarvis wants to run '{call.name}' with:\n{args}")
+    bar = "=" * 64
+    print(
+        f"\n{bar}\n"
+        f"  CONFIRM: Jarvis wants to run an action with side effects\n"
+        f"    tool:      {call.name}\n"
+        f"    category:  {category}\n"
+        f"    arguments:\n{textwrap.indent(args, '      ')}\n"
+        f"{bar}"
+    )
     try:
-        answer = input("Allow? [y/N] ")
+        answer = input("Allow this action? [y/N] ")
     except EOFError:
         return False
     return answer.strip().lower() in {"y", "yes"}
@@ -48,6 +60,7 @@ class Agent:
         *,
         max_iterations: int = 8,
         confirm: ConfirmFn | None = None,
+        confirm_side_effects: bool = True,
     ) -> None:
         """
         Args:
@@ -56,12 +69,15 @@ class Agent:
             max_iterations: Cap on LLM calls per `run`.
             confirm: Approval callback for tools with `requires_confirmation`;
                 defaults to asking on the terminal.
+            confirm_side_effects: Master switch for the gate. False runs
+                side-effect tools without asking (each bypass is logged).
         """
         self.llm = llm
         self.registry = registry
         self.max_iterations = max_iterations
         self.history: list[Message] = []
         self._confirm_fn = confirm
+        self.confirm_side_effects = confirm_side_effects
 
     async def run(self, user_input: str) -> str:
         """Handle one user input end to end and return the reply text.
@@ -135,8 +151,14 @@ class Agent:
 
     def _confirm(self, call: ToolCall) -> bool:
         """Safety gate for risky tools: ask the user before running `call`."""
+        if not self.confirm_side_effects:
+            log.warning("agent.confirmation_bypassed", tool=call.name, reason="confirm_side_effects=False")
+            return True
+        if self._confirm_fn is not None:
+            return self._confirm_fn(call)
+        tool = self.registry.get(call.name)
         # Looked up at call time so tests can monkeypatch `confirm_on_cli`.
-        return (self._confirm_fn or confirm_on_cli)(call)
+        return confirm_on_cli(call, category=tool.category if tool else "general")
 
 
 def _empty_reply(response: LLMResponse) -> str:

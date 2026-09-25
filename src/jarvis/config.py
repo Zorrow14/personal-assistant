@@ -1,11 +1,13 @@
 """Typed application settings, loaded from environment variables and `.env`."""
 
+import json
 import logging
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -94,6 +96,28 @@ class Settings(BaseSettings):
     """Characters shared between consecutive chunks of one note."""
     auto_index: bool = True
     """Index notes written during a turn right after it, so they're searchable at once."""
+
+    # Tools (Phase 5)
+    enabled_tools: Annotated[list[str] | None, NoDecode] = None
+    """Whitelist of tool names; None = every discovered tool. Env: comma-separated or JSON list."""
+    confirm_side_effects: bool = True
+    """Master switch for the y/N gate on tools with side effects. Leave on."""
+    search_max_results: int = Field(default=5, ge=1, le=20)
+    """Default number of web search results."""
+    reminders_path: Path = Path(".jarvis/reminders.json")
+    """Where reminders are stored (local JSON, git-ignored)."""
+    file_sandbox_root: Path | None = None
+    """The only folder `read_local_file` may read under; None = the vault folder."""
+
+    @field_validator("enabled_tools", mode="before")
+    @classmethod
+    def _split_tool_list(cls, value: object) -> object:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [name.strip() for name in text.split(",") if name.strip()]
+        return value
 
     @field_validator("embedder_provider", "vector_store")
     @classmethod

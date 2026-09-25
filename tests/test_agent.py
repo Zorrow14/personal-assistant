@@ -79,7 +79,7 @@ def test_agent_calls_tool_writes_note_and_returns_text(vault: Vault) -> None:
 def test_confirmation_gate_skips_tool_when_declined(monkeypatch: pytest.MonkeyPatch) -> None:
     asked: list[ToolCall] = []
 
-    def deny(call: ToolCall) -> bool:
+    def deny(call: ToolCall, **_: object) -> bool:
         asked.append(call)
         return False
 
@@ -106,7 +106,7 @@ def test_confirmation_gate_runs_tool_when_approved() -> None:
 
 
 def test_tools_without_confirmation_never_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail(call: ToolCall) -> bool:
+    def fail(call: ToolCall, **_: object) -> bool:
         raise AssertionError("should not ask")
 
     monkeypatch.setattr(agent_module, "confirm_on_cli", fail)

@@ -3,12 +3,13 @@
 import asyncio
 from collections.abc import Callable
 from datetime import date
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, Field
 
 from jarvis.core.interfaces import Embedder, SearchHit, VectorStore
 from jarvis.tools.base import Tool
+from jarvis.tools.context import ToolContext
 
 SNIPPET_CHARS = 220
 EMPTY_INDEX_MESSAGE = (
@@ -40,6 +41,17 @@ class SearchMemoryTool(Tool):
     )
     args_model = SearchMemoryArgs
     requires_confirmation = False
+    category = "memory"
+
+    @classmethod
+    def from_context(cls, context: ToolContext) -> Self:
+        """Built by discovery with the shared embedder + index."""
+        return cls(
+            context.memory.embedder,
+            context.memory.store,
+            default_top_k=context.settings.rag_top_k,
+            today=lambda: context.clock().date(),
+        )
 
     def __init__(
         self,

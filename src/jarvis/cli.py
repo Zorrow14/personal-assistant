@@ -4,6 +4,7 @@
     python -m jarvis.cli --voice         push-to-talk voice chat
     python -m jarvis.cli --wake          hands-free: say "Hey Jarvis", then your command
     python -m jarvis.cli --reindex       build/refresh the memory index, then exit
+    python -m jarvis.cli --list-tools    show auto-discovered tools, then exit
     python -m jarvis.cli --health        check config and vault, then exit
     python -m jarvis.cli --list-devices  show audio device indices, then exit
 """
@@ -26,9 +27,8 @@ from jarvis.logging import configure_logging, get_logger
 from jarvis.memory.auto_index import AutoIndexingAgent
 from jarvis.memory.factory import build_memory
 from jarvis.memory.vault import Vault, VaultError
-from jarvis.tools.base import ToolRegistry
-from jarvis.tools.memory_tools import SearchMemoryTool
-from jarvis.tools.vault_tools import WriteTaskNoteTool
+from jarvis.tools.base import DuplicateToolError, ToolRegistry, discover_tool_classes
+from jarvis.tools.context import ToolContext
 
 log = get_logger(__name__)
 
@@ -56,6 +56,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--reindex",
         action="store_true",
         help="build/refresh the memory index over the vault's Jarvis notes, then exit",
+    )
+    mode.add_argument(
+        "--list-tools",
+        action="store_true",
+        help="list auto-discovered tools (category, confirmation, enabled) and exit",
     )
     mode.add_argument(
         "--list-devices",
@@ -89,17 +94,50 @@ def build_agent(settings: Settings) -> Agent:
     """
     vault = Vault(settings.vault_path)
     memory = build_memory(settings, vault.jarvis_root)
-    registry = ToolRegistry()
-    registry.register(WriteTaskNoteTool(vault))
-    registry.register(
-        SearchMemoryTool(memory.embedder, memory.store, default_top_k=settings.rag_top_k)
-    )
+    registry = build_tool_registry(settings, ToolContext(settings, vault, memory))
     llm = create_llm_client(settings)
+    if not settings.confirm_side_effects:
+        log.warning("agent.confirmation_disabled", setting="JARVIS_CONFIRM_SIDE_EFFECTS=false")
+        print(
+            "WARNING: JARVIS_CONFIRM_SIDE_EFFECTS is off: tools with side effects "
+            "will run WITHOUT asking you first.",
+            file=sys.stderr,
+        )
     if settings.auto_index:
         return AutoIndexingAgent(
-            llm, registry, indexer=memory.indexer, max_iterations=settings.agent_max_iterations
+            llm,
+            registry,
+            indexer=memory.indexer,
+            max_iterations=settings.agent_max_iterations,
+            confirm_side_effects=settings.confirm_side_effects,
         )
-    return Agent(llm, registry, max_iterations=settings.agent_max_iterations)
+    return Agent(
+        llm,
+        registry,
+        max_iterations=settings.agent_max_iterations,
+        confirm_side_effects=settings.confirm_side_effects,
+    )
+
+
+def build_tool_registry(settings: Settings, context: ToolContext) -> ToolRegistry:
+    """Discover every tool in `jarvis.tools`, build each from `context`, apply `enabled_tools`.
+
+    Dependency injection: tools pull what they need from the `ToolContext`
+    (vault, memory, settings, clock) in their own `from_context`, so a new
+    tool file needs no change here.
+
+    Raises:
+        DuplicateToolError: If two tools share a name.
+    """
+    registry = ToolRegistry()
+    registry.discover(context=context)
+    for problem in registry.discovery_problems:
+        log.warning("tools.skipped", where=problem.where, error=problem.error)
+    if settings.enabled_tools is not None:
+        unknown = registry.restrict(settings.enabled_tools)
+        if unknown:
+            log.warning("tools.unknown_in_enabled_tools", names=unknown)
+    return registry
 
 
 def run_health() -> int:
@@ -175,6 +213,45 @@ def run_reindex() -> int:
     return 0
 
 
+def run_list_tools() -> int:
+    """Print every discovered tool and whether it's enabled. Returns a process exit code.
+
+    Lists tool classes without building them, so it works even before the
+    vault or API key is configured.
+    """
+    try:
+        classes, problems = discover_tool_classes()
+    except DuplicateToolError as exc:
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+    try:
+        enabled = get_settings().enabled_tools
+    except ValidationError:
+        enabled = None  # config incomplete: list everything as enabled
+
+    rows = [("NAME", "CATEGORY", "CONFIRM", "ENABLED", "MODULE")]
+    for cls in classes:
+        rows.append(
+            (
+                cls.name,
+                cls.category,
+                "yes (y/N)" if cls.requires_confirmation else "no",
+                "yes" if enabled is None or cls.name in enabled else "no",
+                cls.__module__.removeprefix("jarvis.tools."),
+            )
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    print(f"Discovered {len(classes)} tools in jarvis.tools:")
+    for row in rows:
+        print("  " + "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)))
+    if enabled is not None:
+        unknown = sorted(set(enabled) - {cls.name for cls in classes})
+        print(f"\nJARVIS_ENABLED_TOOLS whitelist is active{f'; unknown names: {unknown}' if unknown else ''}.")
+    for problem in problems:
+        print(f"SKIPPED  {problem.where}: {problem.error}")
+    return 0
+
+
 def run_list_devices() -> int:
     """Print audio devices. Returns a process exit code."""
     from jarvis.audio.io import list_devices
@@ -191,7 +268,7 @@ def run_repl() -> int:
         return 1
     try:
         agent = build_agent(settings)
-    except (VaultError, LLMError, RetrievalError) as exc:
+    except (VaultError, LLMError, RetrievalError, DuplicateToolError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
 
@@ -221,7 +298,7 @@ def run_voice() -> int:
         agent = build_agent(settings)
         stt = WhisperSTT.from_settings(settings)
         tts = create_tts_engine(settings)
-    except (VaultError, LLMError, RetrievalError, VoiceError) as exc:
+    except (VaultError, LLMError, RetrievalError, VoiceError, DuplicateToolError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
     session = VoiceSession(agent, stt, tts)
@@ -391,6 +468,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_health()
     if args.list_devices:
         return run_list_devices()
+    if args.list_tools:
+        return run_list_tools()
     if args.reindex:
         return run_reindex()
     if args.voice:

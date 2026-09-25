@@ -1,9 +1,11 @@
 """Test doubles that implement Jarvis interfaces without any network access."""
 
+from __future__ import annotations
+
 import re
 import zlib
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pydantic import BaseModel
@@ -24,6 +26,12 @@ from jarvis.core.interfaces import (
     WakeWordDetector,
 )
 from jarvis.tools.base import Tool
+
+if TYPE_CHECKING:
+    from datetime import datetime
+    from pathlib import Path
+
+    from jarvis.tools.context import ToolContext
 
 
 class FakeSTTEngine(STTEngine):
@@ -209,3 +217,32 @@ class FakeVectorStore(VectorStore):
     def reset(self) -> None:
         self.resets += 1
         self.records.clear()
+
+
+def make_tool_context(
+    tmp_path: Path, *, now: datetime | None = None, **settings_overrides: Any
+) -> ToolContext:
+    """A ToolContext over a tmp vault with fake memory and (optionally) a fixed clock."""
+    from pathlib import Path
+
+    from jarvis.config import Settings
+    from jarvis.memory.factory import MemoryStack
+    from jarvis.memory.indexer import VaultIndexer
+    from jarvis.memory.vault import Vault
+    from jarvis.tools.context import ToolContext, local_now
+
+    root = Path(tmp_path) / "vault"
+    root.mkdir(exist_ok=True)
+    settings = Settings(
+        vault_path=root,
+        reminders_path=Path(tmp_path) / "reminders.json",
+        _env_file=None,  # type: ignore[call-arg]
+        **settings_overrides,
+    )
+    vault = Vault(root)
+    embedder, store = FakeEmbedder(), FakeVectorStore()
+    memory = MemoryStack(
+        embedder, store, VaultIndexer(vault.jarvis_root, embedder, store, Path(tmp_path) / "m.json")
+    )
+    clock = (lambda: now) if now is not None else local_now
+    return ToolContext(settings, vault, memory, clock=clock)

@@ -1,12 +1,13 @@
 """Tools that write to the Obsidian vault."""
 
 import asyncio
-from typing import Any
+from typing import Any, Self
 
 from pydantic import BaseModel, Field
 
 from jarvis.memory.vault import Vault
 from jarvis.tools.base import Tool
+from jarvis.tools.context import ToolContext
 
 
 class WriteTaskNoteArgs(BaseModel):
@@ -35,9 +36,15 @@ class WriteTaskNoteTool(Tool):
     )
     args_model = WriteTaskNoteArgs
     requires_confirmation = False
+    category = "vault"
 
     def __init__(self, vault: Vault) -> None:
         self._vault = vault
+
+    @classmethod
+    def from_context(cls, context: ToolContext) -> Self:
+        """Built by discovery with the configured vault."""
+        return cls(context.vault)
 
     async def run(self, **kwargs: Any) -> str:
         """Write the note and return a confirmation including its path."""

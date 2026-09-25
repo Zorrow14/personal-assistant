@@ -29,9 +29,16 @@ class AutoIndexingAgent(Agent):
         indexer: VaultIndexer,
         max_iterations: int = 8,
         confirm: ConfirmFn | None = None,
+        confirm_side_effects: bool = True,
     ) -> None:
         """Same arguments as `Agent`, plus the `indexer` to update after each turn."""
-        super().__init__(llm, registry, max_iterations=max_iterations, confirm=confirm)
+        super().__init__(
+            llm,
+            registry,
+            max_iterations=max_iterations,
+            confirm=confirm,
+            confirm_side_effects=confirm_side_effects,
+        )
         self.indexer = indexer
 
     async def run(self, user_input: str) -> str:

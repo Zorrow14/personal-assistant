@@ -4,16 +4,26 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 4 (memory).** Type a command, use push-to-talk, or just say
-"Hey Jarvis" and speak. The LLM (Google Gemini) decides which tool to call,
-Jarvis runs it and answers in text or aloud, and each task is journaled to the
-vault. Jarvis can also search its own history: ask "what did I ask you to do
-about X?" and it looks up the relevant past notes and cites them as
-`[[note_name]]`. The wake word (openWakeWord), end-of-speech detection
-(webrtcvad), speech-to-text (faster-whisper), text-to-speech (Piper, or the OS
-voice) and the memory index (fastembed + Chroma) all run locally and cost
-nothing. Barge-in, more tools and a GUI are not built yet; they are marked
-`TODO(phase-N)` in the code.
+**Status: Phase 5 (extensible tools).** Type a command, use push-to-talk, or
+just say "Hey Jarvis" and speak. The LLM (Google Gemini) decides which tool to
+call, Jarvis runs it and answers in text or aloud, and each task is journaled to
+the vault.
+
+Jarvis can also:
+- search its own history and cite past notes as `[[note_name]]`
+- search the web
+- tell the date and time
+- save and list reminders (it asks you first before saving)
+- read text files, but only from inside your vault
+
+Tools are plugins: a new capability is one new file in `src/jarvis/tools/`. See
+[docs/writing-a-tool.md](docs/writing-a-tool.md).
+
+The wake word (openWakeWord), end-of-speech detection (webrtcvad),
+speech-to-text (faster-whisper), text-to-speech (Piper, or the OS voice) and
+the memory index (fastembed + Chroma) all run locally and cost nothing. Not
+built yet, and marked `TODO(phase-N)` in the code: barge-in, reminder alerts,
+account-connected tools (Gmail and Calendar) and a GUI.
 
 ## Requirements
 
@@ -66,6 +76,11 @@ directory you run Jarvis from.
 | `JARVIS_RAG_TOP_K` | no | `5` | Chunks `search_memory` retrieves by default. |
 | `JARVIS_RAG_CHUNK_CHARS` / `JARVIS_RAG_CHUNK_OVERLAP` | no | `1000` / `150` | Chunk size and overlap in characters. Changing either rebuilds the index. |
 | `JARVIS_AUTO_INDEX` | no | `true` | Index notes written during a turn straight after it, so they're searchable immediately. |
+| `JARVIS_ENABLED_TOOLS` | no | all | Comma-separated whitelist of tool names (see `--list-tools`). Leave empty to enable every discovered tool. |
+| `JARVIS_CONFIRM_SIDE_EFFECTS` | no | `true` | Ask y/N before any tool with a side effect runs. Turning it off prints a warning at startup and logs every bypass. |
+| `JARVIS_SEARCH_MAX_RESULTS` | no | `5` | Default number of web search results. |
+| `JARVIS_REMINDERS_PATH` | no | `.jarvis/reminders.json` | Where reminders are saved. It's local and git-ignored. |
+| `JARVIS_FILE_SANDBOX_ROOT` | no | vault folder | The only folder `read_local_file` may read under. |
 
 `.env` is git-ignored. Never commit real keys.
 
@@ -91,6 +106,7 @@ uv run python -m jarvis.cli                 # text chat; type exit or quit, or p
 uv run python -m jarvis.cli --voice         # push-to-talk voice chat
 uv run python -m jarvis.cli --wake          # hands-free: "Hey Jarvis", then your command
 uv run python -m jarvis.cli --reindex       # build/refresh the memory index over existing notes
+uv run python -m jarvis.cli --list-tools    # auto-discovered tools and their confirmation flags
 uv run python -m jarvis.cli --health        # check config + vault, then exit
 uv run python -m jarvis.cli --list-devices  # audio device indices
 uv run pytest                               # offline: fakes for LLM/STT/TTS/wake/VAD/memory, temp vault, no mic
@@ -191,6 +207,32 @@ Run `--reindex` once to index your existing notes. After that:
   once the turn is done. A task you log now can be found in the very next turn,
   in every mode, without touching the vault writer or the tools.
 
+### Tools (plugins)
+
+| Tool | Category | Asks first? | What it does |
+|---|---|---|---|
+| `write_task_note` | vault | no | Logs a task note to `<vault>/Jarvis/Tasks/`. |
+| `search_memory` | memory | no | Semantic search over past notes. |
+| `web_search` | web | no | Searches DuckDuckGo via `ddgs`, with no API key. Returns titles, snippets and URLs. |
+| `get_datetime` | time | no | The current local date, time and timezone. |
+| `set_reminder` | time | **yes** | Saves a reminder, parsing times like "tomorrow at 9am" or "in 2 hours". It doesn't alert you yet. |
+| `list_reminders` | time | no | Lists saved reminders and flags overdue ones. |
+| `read_local_file` | files | no | Reads a text file **only from inside the sandbox**, which is the vault by default. The path is resolved first (following `..`, symlinks and junctions), and anything that lands outside is refused. |
+
+- **Discovery.** `ToolRegistry.discover()` imports every module in
+  `jarvis.tools` and registers each concrete `Tool` subclass. It skips names
+  that start with `_` and abstract bases, and refuses to start if two tools
+  share a name.
+- **Dependencies.** Each tool gets what it needs through `from_context(ToolContext)`,
+  which exposes the vault, memory, settings and clock. The CLI never lists
+  tools one by one.
+- **Broken plugins.** A tool that fails to import or build is skipped and shown
+  under "SKIPPED" in `--list-tools`. It never takes Jarvis down.
+- **The safety gate.** Any tool with `requires_confirmation = True` shows a
+  boxed prompt with the tool, its category and its arguments, then asks
+  `y/N`. Only an explicit `y` or `yes` approves. In `--voice` and `--wake`
+  modes you answer at the keyboard.
+
 ## Vault layout
 
 ```
@@ -228,7 +270,7 @@ so nothing is overwritten.
 src/jarvis/
 ├── config.py             Settings (pydantic-settings)
 ├── logging.py            structlog setup + get_logger()
-├── cli.py                entrypoint: text REPL, --voice, --health, wiring
+├── cli.py                entrypoint: modes, --reindex, --list-tools, --health, wiring
 ├── core/
 │   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types
 │   ├── agent.py          tool-calling loop + confirmation gate
@@ -254,19 +296,26 @@ src/jarvis/
 │   ├── vector_store.py   ChromaStore (chromadb)
 │   ├── auto_index.py     AutoIndexingAgent (index after each turn)
 │   └── factory.py        settings -> embedder + store + indexer
-└── tools/
-    ├── base.py           Tool ABC (pydantic args_model) + ToolRegistry
+└── tools/                (every module here is scanned by discovery)
+    ├── base.py           Tool ABC, ToolRegistry.discover(), duplicate-name guard
+    ├── context.py        ToolContext: dependencies handed to tools
     ├── vault_tools.py    WriteTaskNoteTool
-    └── memory_tools.py   SearchMemoryTool
+    ├── memory_tools.py   SearchMemoryTool
+    ├── web_tools.py      WebSearchTool (ddgs)
+    ├── time_tools.py     GetDateTimeTool, SetReminderTool, ListRemindersTool
+    ├── file_tools.py     ReadLocalFileTool (sandboxed)
+    ├── _reminders.py     time parsing + reminder store (private helper; not scanned)
+    └── _TODO_connected_tools.md   plan for Gmail/Calendar (not implemented)
+docs/writing-a-tool.md    how to add a tool: one file, with a template
 ```
 
-To add an LLM provider, implement `LLMClient` in `llm/` and add a branch to
-`llm/factory.py`. To add a voice engine, implement `STTEngine` or `TTSEngine`
-and add a branch to `tts/factory.py`. Nothing else needs to change.
+To add a tool, drop one file in `tools/` (see the guide). To add an LLM
+provider, implement `LLMClient` in `llm/` and add a branch to `llm/factory.py`.
+To add a voice engine, implement `STTEngine` or `TTSEngine` and add a branch to
+`tts/factory.py`. Nothing else needs to change.
 
 ## Roadmap
 
-- **Phase 5:** more tools and plugin auto-discovery.
-- **Phase 6:** a GUI.
-- **Later:** barge-in (interrupting Jarvis mid-reply with the wake word); an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
-- **Phase 5:** more tools and plugin auto-discovery.
+- **Phase 5.5:** account-connected tools (Gmail, Calendar) behind OAuth, with stricter confirmation. See `tools/_TODO_connected_tools.md`.
+- **Phase 6:** a GUI, and a scheduler that actually alerts you when reminders are due.
+- **Later:** barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
