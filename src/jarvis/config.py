@@ -43,10 +43,33 @@ class Settings(BaseSettings):
     agent_max_iterations: int = Field(default=8, ge=1)
     """Safety cap on LLM round-trips per command in the tool loop."""
 
-    @field_validator("llm_provider")
+    # Voice (Phase 2)
+    sample_rate: int = Field(default=16000, gt=0)
+    """Microphone sample rate in Hz. Whisper wants 16 kHz mono; other rates are resampled."""
+    input_device: int | None = None
+    """Microphone device index (`--list-devices`); None = system default."""
+    output_device: int | None = None
+    """Speaker device index (`--list-devices`); None = system default."""
+    stt_model: str = "base.en"
+    """faster-whisper model size or path, e.g. tiny.en, base.en, small.en."""
+    stt_device: str = "cpu"
+    """Where Whisper runs: cpu, or cuda for an NVIDIA GPU."""
+    stt_compute_type: str = "int8"
+    """Whisper precision: int8 suits CPU, float16 suits GPU."""
+    tts_provider: str = "piper"
+    """Voice engine: piper (local neural voice) or pyttsx3 (OS voice, no setup)."""
+    tts_voice: Path | None = None
+    """Path to a Piper voice `.onnx` file (its `.onnx.json` must sit beside it)."""
+
+    @field_validator("llm_provider", "tts_provider", "stt_device")
     @classmethod
-    def _normalise_provider(cls, value: str) -> str:
+    def _normalise_name(cls, value: str) -> str:
         return value.strip().lower()
+
+    @field_validator("tts_voice")
+    @classmethod
+    def _expand_voice_path(cls, value: Path | None) -> Path | None:
+        return value.expanduser() if value is not None else None
 
     @field_validator("vault_path")
     @classmethod

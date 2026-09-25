@@ -27,6 +27,15 @@ def test_defaults() -> None:
     assert settings.llm_temperature == 0.7
     assert settings.agent_max_iterations == 8
     assert settings.llm_api_key is None
+    assert settings.sample_rate == 16000
+    assert (settings.input_device, settings.output_device) == (None, None)
+    assert (settings.stt_model, settings.stt_device, settings.stt_compute_type) == (
+        "base.en",
+        "cpu",
+        "int8",
+    )
+    assert settings.tts_provider == "piper"
+    assert settings.tts_voice is None
 
 
 def test_api_key_read_from_llm_api_key_and_kept_secret(monkeypatch: pytest.MonkeyPatch) -> None:

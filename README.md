@@ -4,10 +4,12 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 1 (text MVP).** You type a command in the terminal. The LLM
-(Google Gemini) decides which tool to call, Jarvis runs it and replies, and each
-task is journaled to the vault. Voice, semantic search and extra tools are not
-built yet; they are marked `TODO(phase-N)` in the code.
+**Status: Phase 2 (push-to-talk voice).** Type or speak a command. The LLM
+(Google Gemini) decides which tool to call, Jarvis runs it and answers in text
+or aloud, and each task is journaled to the vault. Speech-to-text (faster-whisper)
+and text-to-speech (Piper, or the OS voice) run locally and cost nothing. The
+wake word, semantic search and extra tools are not built yet; they are marked
+`TODO(phase-N)` in the code.
 
 ## Requirements
 
@@ -39,16 +41,49 @@ directory you run Jarvis from.
 | `JARVIS_LLM_MAX_TOKENS` | no | `1024` | Output token cap per reply. |
 | `JARVIS_LLM_TEMPERATURE` | no | `0.7` | Sampling temperature, from 0 to 2. |
 | `JARVIS_AGENT_MAX_ITERATIONS` | no | `8` | Maximum LLM round-trips per command. |
+| `JARVIS_SAMPLE_RATE` | no | `16000` | Microphone rate in Hz. Whisper needs 16 kHz; other rates are resampled. |
+| `JARVIS_INPUT_DEVICE` / `JARVIS_OUTPUT_DEVICE` | no | system default | Device indices from `--list-devices`. |
+| `JARVIS_STT_MODEL` | no | `base.en` | faster-whisper model size (`tiny.en`, `base.en`, `small.en`, ...). |
+| `JARVIS_STT_DEVICE` | no | `cpu` | `cpu`, or `cuda` for an NVIDIA GPU. |
+| `JARVIS_STT_COMPUTE_TYPE` | no | `int8` | `int8` for CPU, `float16` for GPU. |
+| `JARVIS_TTS_PROVIDER` | no | `piper` | `piper` (neural voice, needs a voice file) or `pyttsx3` (OS voice, no setup). |
+| `JARVIS_TTS_VOICE` | for piper | – | Path to a Piper `.onnx` voice. Its `.onnx.json` must sit beside it. |
 
 `.env` is git-ignored. Never commit real keys.
+
+### Voice setup
+
+Download a Piper voice into `voices/` (git-ignored):
+
+```sh
+uv run python -m piper.download_voices en_US-lessac-medium --download-dir voices
+```
+
+Then set `JARVIS_TTS_VOICE=voices/en_US-lessac-medium.onnx`. To skip this step,
+set `JARVIS_TTS_PROVIDER=pyttsx3` and Jarvis will use the built-in OS voice.
+
+The first `--voice` run downloads the Whisper model: about 145 MB for `base.en`,
+cached under `~/.cache/huggingface`. After that, voice mode works offline, apart
+from the Gemini calls.
 
 ## Run
 
 ```sh
-uv run python -m jarvis.cli            # chat; type exit or quit, or press Ctrl-C, to leave
-uv run python -m jarvis.cli --health   # check config + vault, then exit
-uv run pytest                          # offline: uses a fake LLM and a temporary vault
+uv run python -m jarvis.cli                 # text chat; type exit or quit, or press Ctrl-C, to leave
+uv run python -m jarvis.cli --voice         # push-to-talk voice chat
+uv run python -m jarvis.cli --health        # check config + vault, then exit
+uv run python -m jarvis.cli --list-devices  # audio device indices
+uv run pytest                               # offline: fake LLM/STT/TTS, temp vault, no mic
 ```
+
+In voice mode:
+
+1. Press **Enter** and speak.
+2. Press **Enter** again to stop recording.
+3. Jarvis shows the transcript, runs the command, prints the reply and says it aloud.
+
+You can also type a message at the prompt instead of speaking; the reply is
+still spoken. To leave, say or type "exit" or "quit", or press Ctrl-C.
 
 Example:
 
@@ -79,6 +114,13 @@ The agent works only with the neutral types in `core/interfaces.py`. Everything
 specific to Gemini lives in `llm/gemini_client.py`: role mapping, function
 declarations, finish reasons, and retries. The client retries 429 and 5xx errors
 up to 5 times, waiting 1, 2, 4 and then 8 seconds.
+
+Voice is a thin layer around the same `Agent.run`. `core/voice_session.py`
+transcribes the recording (`STTEngine`), calls the agent exactly as text mode
+does, and speaks the reply (`TTSEngine`), with Markdown symbols removed first.
+Blocking model and audio work runs through `asyncio.to_thread`. Each engine's
+vendor code stays in its own module: `stt/whisper_stt.py`,
+`tts/piper_tts.py`, `tts/system_tts.py` and `audio/io.py`.
 
 ## Vault layout
 
@@ -117,10 +159,17 @@ so nothing is overwritten.
 src/jarvis/
 ├── config.py             Settings (pydantic-settings)
 ├── logging.py            structlog setup + get_logger()
-├── cli.py                entrypoint: REPL, --health, wiring
+├── cli.py                entrypoint: text REPL, --voice, --health, wiring
 ├── core/
-│   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral message types
-│   └── agent.py          tool-calling loop + confirmation gate
+│   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types
+│   ├── agent.py          tool-calling loop + confirmation gate
+│   └── voice_session.py  one voice turn: transcribe -> agent -> speak
+├── audio/io.py           mic recording (Enter to stop) + playback (sounddevice)
+├── stt/whisper_stt.py    WhisperSTT (faster-whisper)
+├── tts/
+│   ├── factory.py        tts_provider -> TTSEngine
+│   ├── piper_tts.py      PiperTTS
+│   └── system_tts.py     Pyttsx3TTS (OS voice)
 ├── llm/
 │   ├── factory.py        llm_provider -> LLMClient
 │   └── gemini_client.py  GeminiClient (the only Gemini-aware module)
@@ -130,11 +179,12 @@ src/jarvis/
     └── vault_tools.py    WriteTaskNoteTool
 ```
 
-To add a provider, implement `LLMClient` in `llm/` and add a branch to
-`llm/factory.py`. Nothing else needs to change.
+To add an LLM provider, implement `LLMClient` in `llm/` and add a branch to
+`llm/factory.py`. To add a voice engine, implement `STTEngine` or `TTSEngine`
+and add a branch to `tts/factory.py`. Nothing else needs to change.
 
 ## Roadmap
 
-- **Phases 2–3:** voice: speech-to-text, text-to-speech and a wake word.
+- **Phase 3:** wake word, always-on listening, and automatic stop when you stop talking (voice activity detection).
 - **Phase 4:** semantic search over the vault (`search_vault` is filename-only until then), plus trimming of long conversation histories.
 - **Phase 5:** more tools and plugin auto-discovery.

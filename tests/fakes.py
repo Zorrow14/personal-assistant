@@ -5,8 +5,38 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from jarvis.core.interfaces import LLMClient, LLMResponse, Message, ToolSpec
+from jarvis.core.interfaces import (
+    AudioSamples,
+    LLMClient,
+    LLMResponse,
+    Message,
+    STTEngine,
+    ToolSpec,
+    TTSEngine,
+)
 from jarvis.tools.base import Tool
+
+
+class FakeSTTEngine(STTEngine):
+    """Returns scripted transcripts in order and records the audio it received."""
+
+    def __init__(self, transcripts: Sequence[str]) -> None:
+        self._transcripts = list(transcripts)
+        self.received: list[AudioSamples] = []
+
+    def transcribe(self, audio: AudioSamples) -> str:
+        self.received.append(audio)
+        return self._transcripts.pop(0)
+
+
+class FakeTTSEngine(TTSEngine):
+    """Records everything it was asked to speak."""
+
+    def __init__(self) -> None:
+        self.spoken: list[str] = []
+
+    def speak(self, text: str) -> None:
+        self.spoken.append(text)
 
 
 class FakeLLMClient(LLMClient):

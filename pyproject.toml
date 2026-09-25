@@ -8,9 +8,14 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "faster-whisper>=1.2.1",
     "google-genai>=2.25.0",
+    "piper-tts>=1.8.0",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
+    "pyttsx3>=2.99",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.14.0",
     "structlog>=26.1.0",
 ]
 

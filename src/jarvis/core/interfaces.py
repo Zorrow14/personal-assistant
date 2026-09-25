@@ -5,12 +5,19 @@ providers and local models can be swapped behind them. Provider clients map
 these to and from their own wire formats.
 """
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
+
+import numpy as np
+import numpy.typing as npt
 
 Role = Literal["user", "assistant", "tool"]
+
+AudioSamples: TypeAlias = npt.NDArray[np.float32]
+"""Mono float32 PCM samples in [-1, 1]."""
 
 StopReason = Literal["end_turn", "tool_use", "max_tokens", "safety", "error", "other"]
 """Why the model stopped: finished its turn, wants tools run, hit the output
@@ -19,6 +26,10 @@ limit, was blocked by a safety filter, produced a malformed call, or anything el
 
 class LLMError(Exception):
     """An LLM backend failed (after any retries) or is misconfigured."""
+
+
+class VoiceError(Exception):
+    """A speech-to-text, text-to-speech or audio engine failed or is misconfigured."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,15 +116,20 @@ class STTEngine(ABC):
     """Speech-to-text engine."""
 
     @abstractmethod
-    def transcribe(self, audio: bytes) -> str:
-        """Transcribe raw audio into text.
+    def transcribe(self, audio: AudioSamples) -> str:
+        """Transcribe recorded speech into text. Blocking.
 
         Args:
-            audio: Encoded audio bytes (format defined by the implementation).
+            audio: Mono float32 samples in [-1, 1] at the sample rate the
+                engine was configured with.
 
         Returns:
-            The recognised text.
+            The recognised text, stripped; empty if nothing was heard.
         """
+
+    async def transcribe_async(self, audio: AudioSamples) -> str:
+        """`transcribe` on a worker thread, so the event loop never stalls."""
+        return await asyncio.to_thread(self.transcribe, audio)
 
 
 class TTSEngine(ABC):
@@ -123,5 +139,6 @@ class TTSEngine(ABC):
     def speak(self, text: str) -> None:
         """Speak `text` aloud, blocking until playback finishes."""
 
-
-# TODO(phase-2): concrete STTEngine / TTSEngine implementations.
+    async def speak_async(self, text: str) -> None:
+        """`speak` on a worker thread, so the event loop never stalls."""
+        await asyncio.to_thread(self.speak, text)
