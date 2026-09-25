@@ -1,0 +1,31 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Jarvis: a voice-driven personal assistant that journals its work into an Obsidian vault."
+readme = "README.md"
+authors = [
+    { name = "Zorrow", email = "htetaunglwin223@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=2.25.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "structlog>=26.1.0",
+]
+
+[project.scripts]
+jarvis = "jarvis.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
