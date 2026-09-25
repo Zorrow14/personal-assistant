@@ -4,7 +4,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -76,6 +76,40 @@ class Settings(BaseSettings):
     """Hard cap on one command's recording length."""
     wake_chime: bool = True
     """Play a short cue when the wake word is heard."""
+
+    # Memory / retrieval (Phase 4)
+    embedder_provider: str = "local"
+    """Embedding backend. Only "local" (fastembed, on-device) exists; nothing leaves the machine."""
+    embed_model: str = "BAAI/bge-small-en-v1.5"
+    """fastembed model name; downloaded once on first use."""
+    vector_store: str = "chroma"
+    """Vector store backend. Only "chroma" (embedded, on disk) exists."""
+    chroma_path: Path = Path(".jarvis/chroma")
+    """Where the index lives. Its parent also holds the manifest and model cache."""
+    rag_top_k: int = Field(default=5, ge=1, le=50)
+    """Default number of chunks `search_memory` retrieves."""
+    rag_chunk_chars: int = Field(default=1000, ge=100)
+    """Maximum characters per indexed chunk."""
+    rag_chunk_overlap: int = Field(default=150, ge=0)
+    """Characters shared between consecutive chunks of one note."""
+    auto_index: bool = True
+    """Index notes written during a turn right after it, so they're searchable at once."""
+
+    @field_validator("embedder_provider", "vector_store")
+    @classmethod
+    def _normalise_backend(cls, value: str) -> str:
+        return value.strip().lower()
+
+    @model_validator(mode="after")
+    def _check_chunking(self) -> "Settings":
+        if self.rag_chunk_overlap >= self.rag_chunk_chars:
+            raise ValueError("rag_chunk_overlap must be smaller than rag_chunk_chars")
+        return self
+
+    @property
+    def data_dir(self) -> Path:
+        """Jarvis's local state folder (default `.jarvis/`)."""
+        return self.chroma_path.expanduser().parent
 
     @field_validator("vad_frame_ms")
     @classmethod

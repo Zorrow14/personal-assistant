@@ -179,3 +179,71 @@ class CommandRecorder(Protocol):
     def record_command(self, source: FrameSource) -> AudioSamples:
         """Record from now until the speaker stops (or a length cap), and return the audio."""
         ...
+
+
+# --- Memory / retrieval (Phase 4) -------------------------------------------
+
+MetadataValue: TypeAlias = str | int | float | bool
+"""Metadata values every vector store can hold (no nested structures)."""
+
+
+class RetrievalError(Exception):
+    """An embedder, vector store or index failed or is misconfigured."""
+
+
+@dataclass(frozen=True, slots=True)
+class SearchHit:
+    """One result from a vector search."""
+
+    id: str
+    document: str
+    metadata: dict[str, MetadataValue]
+    score: float
+    """Similarity, higher is closer (cosine similarity for the default store)."""
+
+
+class Embedder(ABC):
+    """Turns text into fixed-length vectors."""
+
+    @property
+    @abstractmethod
+    def dim(self) -> int:
+        """Length of every vector this embedder produces."""
+
+    @abstractmethod
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed documents in one batch. Blocking."""
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a search query. Models trained with a query prefix override this."""
+        return self.embed([text])[0]
+
+
+class VectorStore(ABC):
+    """Stores embedded chunks and finds the nearest ones to a query vector."""
+
+    @abstractmethod
+    def upsert(
+        self,
+        ids: list[str],
+        embeddings: list[list[float]],
+        documents: list[str],
+        metadatas: list[dict[str, MetadataValue]],
+    ) -> None:
+        """Insert or replace records by id. Blocking."""
+
+    @abstractmethod
+    def query(self, embedding: list[float], top_k: int) -> list[SearchHit]:
+        """Return up to `top_k` nearest records, best first. Blocking."""
+
+    @abstractmethod
+    def delete(self, ids: list[str]) -> None:
+        """Remove records by id; unknown ids are ignored. Blocking."""
+
+    @abstractmethod
+    def count(self) -> int:
+        """Number of stored records."""
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Remove every record (e.g. when the embedding model changes)."""

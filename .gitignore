@@ -21,3 +21,6 @@ wheels/
 
 # Downloaded Piper voices (large model files)
 voices/
+
+# Local index, manifest and embedding-model cache (Phase 4)
+.jarvis/

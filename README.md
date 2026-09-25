@@ -4,13 +4,16 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 3 (hands-free voice).** Type a command, use push-to-talk, or just
-say "Hey Jarvis" and speak. The LLM (Google Gemini) decides which tool to call,
+**Status: Phase 4 (memory).** Type a command, use push-to-talk, or just say
+"Hey Jarvis" and speak. The LLM (Google Gemini) decides which tool to call,
 Jarvis runs it and answers in text or aloud, and each task is journaled to the
-vault. The wake word (openWakeWord), end-of-speech detection (webrtcvad),
-speech-to-text (faster-whisper) and text-to-speech (Piper, or the OS voice) all
-run locally and cost nothing. Barge-in, semantic search and extra tools are not
-built yet; they are marked `TODO(phase-N)` in the code.
+vault. Jarvis can also search its own history: ask "what did I ask you to do
+about X?" and it looks up the relevant past notes and cites them as
+`[[note_name]]`. The wake word (openWakeWord), end-of-speech detection
+(webrtcvad), speech-to-text (faster-whisper), text-to-speech (Piper, or the OS
+voice) and the memory index (fastembed + Chroma) all run locally and cost
+nothing. Barge-in, more tools and a GUI are not built yet; they are marked
+`TODO(phase-N)` in the code.
 
 ## Requirements
 
@@ -56,6 +59,13 @@ directory you run Jarvis from.
 | `JARVIS_VAD_FRAME_MS` | no | `30` | VAD frame length: 10, 20 or 30 ms. |
 | `JARVIS_COMMAND_MAX_SECONDS` | no | `15` | Hard cap on one command's length. |
 | `JARVIS_WAKE_CHIME` | no | `true` | Play a short cue when the wake word is heard. |
+| `JARVIS_EMBEDDER_PROVIDER` | no | `local` | Embedding backend. Only `local` (on-device fastembed) exists, so note text never leaves the machine. |
+| `JARVIS_EMBED_MODEL` | no | `BAAI/bge-small-en-v1.5` | fastembed model. It downloads once (about 70 MB) into `.jarvis/fastembed`. Changing it rebuilds the index. |
+| `JARVIS_VECTOR_STORE` | no | `chroma` | Vector store. Only `chroma` (embedded, on disk) exists. |
+| `JARVIS_CHROMA_PATH` | no | `.jarvis/chroma` | Where the index lives, relative to where you run Jarvis. The manifest and model cache sit next to it. |
+| `JARVIS_RAG_TOP_K` | no | `5` | Chunks `search_memory` retrieves by default. |
+| `JARVIS_RAG_CHUNK_CHARS` / `JARVIS_RAG_CHUNK_OVERLAP` | no | `1000` / `150` | Chunk size and overlap in characters. Changing either rebuilds the index. |
+| `JARVIS_AUTO_INDEX` | no | `true` | Index notes written during a turn straight after it, so they're searchable immediately. |
 
 `.env` is git-ignored. Never commit real keys.
 
@@ -80,9 +90,10 @@ from the Gemini calls.
 uv run python -m jarvis.cli                 # text chat; type exit or quit, or press Ctrl-C, to leave
 uv run python -m jarvis.cli --voice         # push-to-talk voice chat
 uv run python -m jarvis.cli --wake          # hands-free: "Hey Jarvis", then your command
+uv run python -m jarvis.cli --reindex       # build/refresh the memory index over existing notes
 uv run python -m jarvis.cli --health        # check config + vault, then exit
 uv run python -m jarvis.cli --list-devices  # audio device indices
-uv run pytest                               # offline: fakes for LLM/STT/TTS/wake/VAD, temp vault, no mic
+uv run pytest                               # offline: fakes for LLM/STT/TTS/wake/VAD/memory, temp vault, no mic
 ```
 
 In hands-free mode (`--wake`), no keys are needed:
@@ -158,6 +169,28 @@ window still holds "Hey Jarvis" and fires again immediately (a measured score of
 turns and keeps listening, but it stops after 3 failures in a row rather than
 spinning on a broken device.
 
+### Memory (retrieval)
+
+Run `--reindex` once to index your existing notes. After that:
+
+- **`search_memory`** is a read-only tool. It embeds the question and finds the
+  nearest note chunks. It returns one entry per note: the `[[note_name]]`, the
+  date, the tags, a relevance score and a snippet. It also states today's date
+  so the model can work out relative dates like "last week". The model is told
+  to answer only from these results and to say so when nothing fits.
+- **Indexing** reads everything under `<vault>/Jarvis/`. The text it embeds for
+  each note is the frontmatter `command` plus the note body. That text is split
+  into chunks with ids like `Tasks/<file>.md::0`, so re-indexing replaces chunks
+  rather than duplicating them.
+- **The manifest** (`.jarvis/index_manifest.json`) keeps a content hash for each
+  note. Unchanged notes are skipped, edited notes are re-embedded (stale chunks
+  are removed), and deleted notes are dropped. If the embedding model, the
+  chunking settings or the vault change, the whole index is rebuilt.
+- **Auto-index:** `AutoIndexingAgent` is a subclass of `Agent`. It records each
+  note's size and modified time before a turn, then indexes whatever changed
+  once the turn is done. A task you log now can be found in the very next turn,
+  in every mode, without touching the vault writer or the tools.
+
 ## Vault layout
 
 ```
@@ -213,10 +246,18 @@ src/jarvis/
 ├── llm/
 │   ├── factory.py        llm_provider -> LLMClient
 │   └── gemini_client.py  GeminiClient (the only Gemini-aware module)
-├── memory/vault.py       Obsidian vault writer + path guard
+├── memory/
+│   ├── vault.py          Obsidian vault writer + path guard
+│   ├── documents.py      frontmatter parsing + chunking
+│   ├── indexer.py        VaultIndexer (incremental, manifest-based)
+│   ├── embedder.py       LocalEmbedder (fastembed)
+│   ├── vector_store.py   ChromaStore (chromadb)
+│   ├── auto_index.py     AutoIndexingAgent (index after each turn)
+│   └── factory.py        settings -> embedder + store + indexer
 └── tools/
     ├── base.py           Tool ABC (pydantic args_model) + ToolRegistry
-    └── vault_tools.py    WriteTaskNoteTool
+    ├── vault_tools.py    WriteTaskNoteTool
+    └── memory_tools.py   SearchMemoryTool
 ```
 
 To add an LLM provider, implement `LLMClient` in `llm/` and add a branch to
@@ -225,6 +266,7 @@ and add a branch to `tts/factory.py`. Nothing else needs to change.
 
 ## Roadmap
 
-- **Later:** barge-in, meaning you can interrupt Jarvis while it's speaking by saying the wake word.
-- **Phase 4:** semantic search over the vault (`search_vault` is filename-only until then), plus trimming of long conversation histories.
+- **Phase 5:** more tools and plugin auto-discovery.
+- **Phase 6:** a GUI.
+- **Later:** barge-in (interrupting Jarvis mid-reply with the wake word); an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
 - **Phase 5:** more tools and plugin auto-discovery.

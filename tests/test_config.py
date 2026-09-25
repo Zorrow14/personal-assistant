@@ -36,6 +36,22 @@ def test_defaults() -> None:
     )
     assert settings.tts_provider == "piper"
     assert settings.tts_voice is None
+    assert (settings.embedder_provider, settings.embed_model, settings.vector_store) == (
+        "local",
+        "BAAI/bge-small-en-v1.5",
+        "chroma",
+    )
+    assert settings.chroma_path == Path(".jarvis/chroma")
+    assert settings.data_dir == Path(".jarvis")
+    assert (settings.rag_top_k, settings.rag_chunk_chars, settings.rag_chunk_overlap) == (5, 1000, 150)
+    assert settings.auto_index is True
+
+
+def test_chunk_overlap_must_be_smaller_than_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JARVIS_RAG_CHUNK_CHARS", "200")
+    monkeypatch.setenv("JARVIS_RAG_CHUNK_OVERLAP", "200")
+    with pytest.raises(ValidationError, match="rag_chunk_overlap"):
+        _settings()
 
 
 def test_api_key_read_from_llm_api_key_and_kept_secret(monkeypatch: pytest.MonkeyPatch) -> None:

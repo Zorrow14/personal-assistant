@@ -3,6 +3,7 @@
     python -m jarvis.cli                 interactive text chat
     python -m jarvis.cli --voice         push-to-talk voice chat
     python -m jarvis.cli --wake          hands-free: say "Hey Jarvis", then your command
+    python -m jarvis.cli --reindex       build/refresh the memory index, then exit
     python -m jarvis.cli --health        check config and vault, then exit
     python -m jarvis.cli --list-devices  show audio device indices, then exit
 """
@@ -10,6 +11,7 @@
 import argparse
 import asyncio
 import sys
+import time
 from collections.abc import Callable, Sequence
 
 from pydantic import ValidationError
@@ -17,12 +19,15 @@ from pydantic import ValidationError
 from jarvis import __version__
 from jarvis.config import Settings, get_settings
 from jarvis.core.agent import Agent
-from jarvis.core.interfaces import AudioSamples, LLMError, VoiceError
+from jarvis.core.interfaces import AudioSamples, LLMError, RetrievalError, VoiceError
 from jarvis.core.voice_session import EXIT_COMMANDS, TurnOutcome, VoiceSession
 from jarvis.llm.factory import create_llm_client
 from jarvis.logging import configure_logging, get_logger
+from jarvis.memory.auto_index import AutoIndexingAgent
+from jarvis.memory.factory import build_memory
 from jarvis.memory.vault import Vault, VaultError
 from jarvis.tools.base import ToolRegistry
+from jarvis.tools.memory_tools import SearchMemoryTool
 from jarvis.tools.vault_tools import WriteTaskNoteTool
 
 log = get_logger(__name__)
@@ -48,6 +53,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="hands-free voice chat: wake word, then auto-stop when you stop talking",
     )
     mode.add_argument(
+        "--reindex",
+        action="store_true",
+        help="build/refresh the memory index over the vault's Jarvis notes, then exit",
+    )
+    mode.add_argument(
         "--list-devices",
         action="store_true",
         help="list audio devices (for JARVIS_INPUT_DEVICE / JARVIS_OUTPUT_DEVICE) and exit",
@@ -67,16 +77,28 @@ def _load_settings() -> Settings | None:
 
 
 def build_agent(settings: Settings) -> Agent:
-    """Wire everything together: vault -> tools -> LLM client -> agent.
+    """Wire everything together: vault -> memory -> tools -> LLM client -> agent.
+
+    Memory backends are created but not loaded; the embedding model and index
+    open on first use, so startup stays fast.
 
     Raises:
         VaultError: If the vault path is invalid.
+        RetrievalError: If a memory backend is unknown.
         LLMError: If the LLM provider is unknown or misconfigured.
     """
     vault = Vault(settings.vault_path)
+    memory = build_memory(settings, vault.jarvis_root)
     registry = ToolRegistry()
     registry.register(WriteTaskNoteTool(vault))
+    registry.register(
+        SearchMemoryTool(memory.embedder, memory.store, default_top_k=settings.rag_top_k)
+    )
     llm = create_llm_client(settings)
+    if settings.auto_index:
+        return AutoIndexingAgent(
+            llm, registry, indexer=memory.indexer, max_iterations=settings.agent_max_iterations
+        )
     return Agent(llm, registry, max_iterations=settings.agent_max_iterations)
 
 
@@ -110,6 +132,46 @@ def run_health() -> int:
         f"vad {settings.vad_aggressiveness} / {settings.vad_silence_ms} ms silence / "
         f"{settings.command_max_seconds:g} s max"
     )
+    try:
+        indexed = build_memory(settings, vault.jarvis_root).indexer.indexed_notes()
+        index_status = f"{indexed} notes indexed" if indexed else "not indexed yet (run --reindex)"
+    except RetrievalError as exc:
+        index_status = f"MISCONFIGURED: {exc}"
+    auto = "on" if settings.auto_index else "off"
+    print(
+        f"    memory:  {settings.embedder_provider} {settings.embed_model} -> "
+        f"{settings.vector_store} at {settings.chroma_path}, {index_status}, auto-index {auto}"
+    )
+    return 0
+
+
+def run_reindex() -> int:
+    """Build or refresh the memory index over the whole vault. Returns a process exit code."""
+    settings = _load_settings()
+    if settings is None:
+        return 1
+    try:
+        vault = Vault(settings.vault_path)
+        memory = build_memory(settings, vault.jarvis_root)
+        print(
+            f"Indexing {vault.jarvis_root} with {settings.embed_model} "
+            "(the first run downloads the model, about 70 MB)..."
+        )
+        started = time.perf_counter()
+        stats = memory.indexer.reindex_all()
+        total_chunks = memory.store.count()
+    except (VaultError, RetrievalError) as exc:
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"OK  indexed in {time.perf_counter() - started:.1f}s: {stats.added} added, "
+        f"{stats.updated} updated, {stats.skipped} unchanged, {stats.removed} removed "
+        f"({stats.chunks} chunks embedded)"
+    )
+    print(
+        f"    index: {memory.indexer.indexed_notes()} notes, {total_chunks} chunks "
+        f"at {settings.chroma_path}"
+    )
     return 0
 
 
@@ -129,7 +191,7 @@ def run_repl() -> int:
         return 1
     try:
         agent = build_agent(settings)
-    except (VaultError, LLMError) as exc:
+    except (VaultError, LLMError, RetrievalError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
 
@@ -159,7 +221,7 @@ def run_voice() -> int:
         agent = build_agent(settings)
         stt = WhisperSTT.from_settings(settings)
         tts = create_tts_engine(settings)
-    except (VaultError, LLMError, VoiceError) as exc:
+    except (VaultError, LLMError, RetrievalError, VoiceError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
     session = VoiceSession(agent, stt, tts)
@@ -214,7 +276,7 @@ def run_wake() -> int:
             max_seconds=settings.command_max_seconds,
             sample_rate=STREAM_SAMPLE_RATE,
         )
-    except (VaultError, LLMError, VoiceError, ValueError) as exc:
+    except (VaultError, LLMError, RetrievalError, VoiceError, ValueError) as exc:
         print(f"FAIL  {exc}", file=sys.stderr)
         return 1
 
@@ -329,6 +391,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_health()
     if args.list_devices:
         return run_list_devices()
+    if args.reindex:
+        return run_reindex()
     if args.voice:
         return run_voice()
     if args.wake:

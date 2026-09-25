@@ -1,5 +1,7 @@
 """Test doubles that implement Jarvis interfaces without any network access."""
 
+import re
+import zlib
 from collections.abc import Sequence
 from typing import Any
 
@@ -8,13 +10,17 @@ from pydantic import BaseModel
 
 from jarvis.core.interfaces import (
     AudioSamples,
+    Embedder,
     FrameSource,
     LLMClient,
     LLMResponse,
     Message,
+    MetadataValue,
+    SearchHit,
     STTEngine,
     ToolSpec,
     TTSEngine,
+    VectorStore,
     WakeWordDetector,
 )
 from jarvis.tools.base import Tool
@@ -142,3 +148,64 @@ class FakeVAD:
     def record_command(self, source: FrameSource) -> AudioSamples:
         self.calls += 1
         return self.buffer
+
+
+class FakeEmbedder(Embedder):
+    """Deterministic bag-of-words hashing vectors: similar wording -> similar vectors."""
+
+    def __init__(self, dim: int = 64) -> None:
+        self._dim = dim
+        self.calls = 0
+        self.texts_embedded = 0
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls += 1
+        self.texts_embedded += len(texts)
+        return [self._vector(t) for t in texts]
+
+    def _vector(self, text: str) -> list[float]:
+        vec = np.zeros(self._dim)
+        for word in re.findall(r"[a-z0-9]+", text.lower()):
+            vec[zlib.crc32(word.encode()) % self._dim] += 1.0
+        norm = np.linalg.norm(vec)
+        return (vec / norm if norm else vec).tolist()
+
+
+class FakeVectorStore(VectorStore):
+    """In-memory store with cosine similarity; records upserts and deletes."""
+
+    def __init__(self) -> None:
+        self.records: dict[str, tuple[list[float], str, dict[str, MetadataValue]]] = {}
+        self.upserted: list[str] = []
+        self.deleted: list[str] = []
+        self.resets = 0
+
+    def upsert(self, ids, embeddings, documents, metadatas) -> None:  # type: ignore[no-untyped-def]
+        for i, record_id in enumerate(ids):
+            self.records[record_id] = (embeddings[i], documents[i], dict(metadatas[i]))
+            self.upserted.append(record_id)
+
+    def query(self, embedding: list[float], top_k: int) -> list[SearchHit]:
+        q = np.asarray(embedding)
+        scored = []
+        for record_id, (vec, doc, meta) in self.records.items():
+            v = np.asarray(vec)
+            denom = np.linalg.norm(q) * np.linalg.norm(v)
+            scored.append(SearchHit(record_id, doc, meta, float(q @ v / denom) if denom else 0.0))
+        return sorted(scored, key=lambda h: h.score, reverse=True)[:top_k]
+
+    def delete(self, ids: list[str]) -> None:
+        for record_id in ids:
+            self.deleted.append(record_id)
+            self.records.pop(record_id, None)
+
+    def count(self) -> int:
+        return len(self.records)
+
+    def reset(self) -> None:
+        self.resets += 1
+        self.records.clear()
