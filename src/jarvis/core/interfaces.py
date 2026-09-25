@@ -9,7 +9,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -142,3 +142,40 @@ class TTSEngine(ABC):
     async def speak_async(self, text: str) -> None:
         """`speak` on a worker thread, so the event loop never stalls."""
         await asyncio.to_thread(self.speak, text)
+
+
+class WakeWordDetector(ABC):
+    """Streaming wake-word detector fed fixed-size frames of 16 kHz mono audio."""
+
+    @property
+    @abstractmethod
+    def frame_samples(self) -> int:
+        """Samples per frame that `process` expects."""
+
+    @abstractmethod
+    def process(self, frame: AudioSamples) -> float:
+        """Feed one frame (`frame_samples` long) and return the current wake score, 0–1."""
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Clear internal state after a trigger so the same audio can't fire again."""
+
+
+class FrameSource(Protocol):
+    """A live audio source that consumers read in frames of their chosen size."""
+
+    def read(self, n_samples: int) -> AudioSamples:
+        """Block until `n_samples` mono float32 samples are available and return them."""
+        ...
+
+    def clear(self) -> None:
+        """Discard any audio buffered but not yet read."""
+        ...
+
+
+class CommandRecorder(Protocol):
+    """Records one spoken command from a live source, deciding when it has ended."""
+
+    def record_command(self, source: FrameSource) -> AudioSamples:
+        """Record from now until the speaker stops (or a length cap), and return the audio."""
+        ...

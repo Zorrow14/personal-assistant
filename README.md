@@ -4,12 +4,13 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 2 (push-to-talk voice).** Type or speak a command. The LLM
-(Google Gemini) decides which tool to call, Jarvis runs it and answers in text
-or aloud, and each task is journaled to the vault. Speech-to-text (faster-whisper)
-and text-to-speech (Piper, or the OS voice) run locally and cost nothing. The
-wake word, semantic search and extra tools are not built yet; they are marked
-`TODO(phase-N)` in the code.
+**Status: Phase 3 (hands-free voice).** Type a command, use push-to-talk, or just
+say "Hey Jarvis" and speak. The LLM (Google Gemini) decides which tool to call,
+Jarvis runs it and answers in text or aloud, and each task is journaled to the
+vault. The wake word (openWakeWord), end-of-speech detection (webrtcvad),
+speech-to-text (faster-whisper) and text-to-speech (Piper, or the OS voice) all
+run locally and cost nothing. Barge-in, semantic search and extra tools are not
+built yet; they are marked `TODO(phase-N)` in the code.
 
 ## Requirements
 
@@ -48,6 +49,13 @@ directory you run Jarvis from.
 | `JARVIS_STT_COMPUTE_TYPE` | no | `int8` | `int8` for CPU, `float16` for GPU. |
 | `JARVIS_TTS_PROVIDER` | no | `piper` | `piper` (neural voice, needs a voice file) or `pyttsx3` (OS voice, no setup). |
 | `JARVIS_TTS_VOICE` | for piper | – | Path to a Piper `.onnx` voice. Its `.onnx.json` must sit beside it. |
+| `JARVIS_WAKE_WORD_MODEL` | no | `hey_jarvis` | openWakeWord pretrained model name, or a path to a custom `.onnx`. |
+| `JARVIS_WAKE_WORD_THRESHOLD` | no | `0.5` | Wake score, from 0 to 1. Higher means fewer false triggers but more misses. |
+| `JARVIS_VAD_AGGRESSIVENESS` | no | `2` | webrtcvad strictness, 0–3. Raise it in noisy rooms. |
+| `JARVIS_VAD_SILENCE_MS` | no | `800` | Trailing silence that ends a command. Raise it if you get cut off. |
+| `JARVIS_VAD_FRAME_MS` | no | `30` | VAD frame length: 10, 20 or 30 ms. |
+| `JARVIS_COMMAND_MAX_SECONDS` | no | `15` | Hard cap on one command's length. |
+| `JARVIS_WAKE_CHIME` | no | `true` | Play a short cue when the wake word is heard. |
 
 `.env` is git-ignored. Never commit real keys.
 
@@ -71,12 +79,25 @@ from the Gemini calls.
 ```sh
 uv run python -m jarvis.cli                 # text chat; type exit or quit, or press Ctrl-C, to leave
 uv run python -m jarvis.cli --voice         # push-to-talk voice chat
+uv run python -m jarvis.cli --wake          # hands-free: "Hey Jarvis", then your command
 uv run python -m jarvis.cli --health        # check config + vault, then exit
 uv run python -m jarvis.cli --list-devices  # audio device indices
-uv run pytest                               # offline: fake LLM/STT/TTS, temp vault, no mic
+uv run pytest                               # offline: fakes for LLM/STT/TTS/wake/VAD, temp vault, no mic
 ```
 
-In voice mode:
+In hands-free mode (`--wake`), no keys are needed:
+
+1. Say **"Hey Jarvis"** and wait for the chime.
+2. Say your command, then stop talking. Recording ends after 0.8 s of silence.
+3. Jarvis shows the transcript, runs the command, and speaks the reply.
+4. It goes back to listening for the wake word.
+
+Say "Hey Jarvis… exit", or press Ctrl-C, to quit. The wake-word model ships
+with openWakeWord, so there is nothing extra to download. While Jarvis is
+speaking it doesn't listen for the wake word, and anything the mic picks up
+during that time, including Jarvis's own voice, is thrown away.
+
+In push-to-talk mode (`--voice`):
 
 1. Press **Enter** and speak.
 2. Press **Enter** again to stop recording.
@@ -122,6 +143,21 @@ Blocking model and audio work runs through `asyncio.to_thread`. Each engine's
 vendor code stays in its own module: `stt/whisper_stt.py`,
 `tts/piper_tts.py`, `tts/system_tts.py` and `audio/io.py`.
 
+Hands-free mode adds a small state machine, `core/voice_loop.py`:
+
+```
+IDLE ──wake word──▶ LISTENING ──silence or cap──▶ PROCESSING ──text──▶ SPEAKING ──▶ IDLE
+                                                       └── empty transcript ──▶ IDLE
+```
+
+One 16 kHz `MicStream` feeds both consumers. The wake detector reads it in
+80 ms frames and the VAD in 30 ms frames. After a trigger, the detector is
+reset and fed a moment of silence. Without that, openWakeWord's rolling feature
+window still holds "Hey Jarvis" and fires again immediately (a measured score of
+0.98 without the flush, 0.00 with it). The loop reports LLM errors and failed
+turns and keeps listening, but it stops after 3 failures in a row rather than
+spinning on a broken device.
+
 ## Vault layout
 
 ```
@@ -163,8 +199,12 @@ src/jarvis/
 ├── core/
 │   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types
 │   ├── agent.py          tool-calling loop + confirmation gate
-│   └── voice_session.py  one voice turn: transcribe -> agent -> speak
-├── audio/io.py           mic recording (Enter to stop) + playback (sounddevice)
+│   ├── voice_session.py  one push-to-talk turn: transcribe -> agent -> speak
+│   └── voice_loop.py     hands-free state machine (IDLE/LISTENING/PROCESSING/SPEAKING)
+├── audio/
+│   ├── io.py             mic (Enter-to-stop recording, shared MicStream), playback, chime
+│   └── vad.py            webrtcvad end-of-command detection
+├── wakeword/openwakeword_detector.py  OpenWakeWordDetector
 ├── stt/whisper_stt.py    WhisperSTT (faster-whisper)
 ├── tts/
 │   ├── factory.py        tts_provider -> TTSEngine
@@ -185,6 +225,6 @@ and add a branch to `tts/factory.py`. Nothing else needs to change.
 
 ## Roadmap
 
-- **Phase 3:** wake word, always-on listening, and automatic stop when you stop talking (voice activity detection).
+- **Later:** barge-in, meaning you can interrupt Jarvis while it's speaking by saying the wake word.
 - **Phase 4:** semantic search over the vault (`search_vault` is filename-only until then), plus trimming of long conversation histories.
 - **Phase 5:** more tools and plugin auto-discovery.

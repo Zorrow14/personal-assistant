@@ -2,6 +2,7 @@
 
     python -m jarvis.cli                 interactive text chat
     python -m jarvis.cli --voice         push-to-talk voice chat
+    python -m jarvis.cli --wake          hands-free: say "Hey Jarvis", then your command
     python -m jarvis.cli --health        check config and vault, then exit
     python -m jarvis.cli --list-devices  show audio device indices, then exit
 """
@@ -40,6 +41,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--voice",
         action="store_true",
         help="push-to-talk voice chat (Enter to start/stop recording)",
+    )
+    mode.add_argument(
+        "--wake",
+        action="store_true",
+        help="hands-free voice chat: wake word, then auto-stop when you stop talking",
     )
     mode.add_argument(
         "--list-devices",
@@ -99,6 +105,11 @@ def run_health() -> int:
     print(f"    llm:     {settings.llm_provider} / {settings.llm_model}, api key {key_status}")
     print(f"    stt:     whisper {settings.stt_model} ({settings.stt_device}, {settings.stt_compute_type})")
     print(f"    tts:     {tts}")
+    print(
+        f"    wake:    '{settings.wake_word_model}' (threshold {settings.wake_word_threshold}), "
+        f"vad {settings.vad_aggressiveness} / {settings.vad_silence_ms} ms silence / "
+        f"{settings.command_max_seconds:g} s max"
+    )
     return 0
 
 
@@ -176,6 +187,86 @@ def run_voice() -> int:
     return 0
 
 
+def run_wake() -> int:
+    """Hands-free wake-word voice loop. Returns a process exit code."""
+    settings = _load_settings()
+    if settings is None:
+        return 1
+
+    # Voice deps are imported only in voice modes, keeping text mode light.
+    from jarvis.audio.io import STREAM_SAMPLE_RATE, MicStream, play_chime
+    from jarvis.audio.vad import VoiceActivityDetector
+    from jarvis.core.voice_loop import WakeWordLoop
+    from jarvis.stt.whisper_stt import WhisperSTT
+    from jarvis.tts.factory import create_tts_engine
+    from jarvis.wakeword.openwakeword_detector import OpenWakeWordDetector
+
+    try:
+        agent = build_agent(settings)
+        # The shared mic stream is always 16 kHz, whatever JARVIS_SAMPLE_RATE says for --voice.
+        stt = WhisperSTT.from_settings(settings.model_copy(update={"sample_rate": STREAM_SAMPLE_RATE}))
+        tts = create_tts_engine(settings)
+        detector = OpenWakeWordDetector(settings.wake_word_model)
+        recorder = VoiceActivityDetector(
+            aggressiveness=settings.vad_aggressiveness,
+            frame_ms=settings.vad_frame_ms,
+            silence_ms=settings.vad_silence_ms,
+            max_seconds=settings.command_max_seconds,
+            sample_rate=STREAM_SAMPLE_RATE,
+        )
+    except (VaultError, LLMError, VoiceError, ValueError) as exc:
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+
+    def chime() -> None:
+        play_chime(settings.output_device)
+
+    wake_phrase = _wake_phrase(settings.wake_word_model)
+    with asyncio.Runner() as runner:
+        try:
+            print(f"Loading models (Whisper '{settings.stt_model}' downloads on first run)...")
+            runner.run(asyncio.to_thread(stt.load))
+            runner.run(asyncio.to_thread(detector.load))
+            with MicStream(STREAM_SAMPLE_RATE, settings.input_device) as mic:
+                loop = WakeWordLoop(
+                    agent,
+                    stt,
+                    tts,
+                    detector,
+                    recorder,
+                    mic,
+                    threshold=settings.wake_word_threshold,
+                    chime=chime if settings.wake_chime else None,
+                    wake_phrase=wake_phrase,
+                    display=_safe_print,
+                )
+                print(f"Jarvis is listening. Say '{wake_phrase}', then your command. Ctrl-C to quit.")
+                runner.run(loop.run())
+        except KeyboardInterrupt:
+            print()
+        except VoiceError as exc:
+            print(f"FAIL  {exc}", file=sys.stderr)
+            return 1
+        finally:
+            runner.run(agent.llm.aclose())
+    print("Bye.")
+    return 0
+
+
+def _wake_phrase(model: str) -> str:
+    """'hey_jarvis' -> 'Hey Jarvis'; a model path -> its file stem, prettified."""
+    stem = model.replace("\\", "/").rsplit("/", 1)[-1].removesuffix(".onnx")
+    return stem.replace("_", " ").title()
+
+
+def _safe_print(text: str) -> None:
+    """Print, falling back to ASCII if the console can't show emoji."""
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "replace").decode("ascii"), flush=True)
+
+
 def _chat(agent: Agent, runner: asyncio.Runner) -> None:
     while True:
         try:
@@ -205,7 +296,7 @@ def _chat(agent: Agent, runner: asyncio.Runner) -> None:
 def _voice_chat(
     session: VoiceSession, runner: asyncio.Runner, record: Callable[[], AudioSamples]
 ) -> None:
-    # TODO(phase-3): wake word + always-listening loop, and VAD auto-stop on silence.
+    # Push-to-talk stays manual on purpose; the hands-free loop is `run_wake`.
     while True:
         try:
             typed = input("\nPress Enter to talk (or type a message, or 'exit'): ").strip()
@@ -240,6 +331,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_list_devices()
     if args.voice:
         return run_voice()
+    if args.wake:
+        return run_wake()
     return run_repl()
 
 

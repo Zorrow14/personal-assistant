@@ -3,16 +3,19 @@
 from collections.abc import Sequence
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel
 
 from jarvis.core.interfaces import (
     AudioSamples,
+    FrameSource,
     LLMClient,
     LLMResponse,
     Message,
     STTEngine,
     ToolSpec,
     TTSEngine,
+    WakeWordDetector,
 )
 from jarvis.tools.base import Tool
 
@@ -88,3 +91,54 @@ class ExplodingTool(RecordingTool):
 
     async def run(self, **kwargs: Any) -> str:
         raise RuntimeError("kaboom")
+
+
+class FakeWakeWordDetector(WakeWordDetector):
+    """Returns scripted wake scores, one per frame, and records resets."""
+
+    def __init__(self, scores: Sequence[float], frame_samples: int = 1280) -> None:
+        self._scores = list(scores)
+        self._frame_samples = frame_samples
+        self.frames_seen = 0
+        self.resets = 0
+
+    @property
+    def frame_samples(self) -> int:
+        return self._frame_samples
+
+    def process(self, frame: AudioSamples) -> float:
+        assert len(frame) == self._frame_samples
+        self.frames_seen += 1
+        if not self._scores:
+            raise AssertionError("FakeWakeWordDetector ran out of scripted scores")
+        return self._scores.pop(0)
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+class FakeFrameSource:
+    """Endless silence, recording how much was read and how often it was cleared."""
+
+    def __init__(self) -> None:
+        self.samples_read = 0
+        self.clears = 0
+
+    def read(self, n_samples: int) -> AudioSamples:
+        self.samples_read += n_samples
+        return np.zeros(n_samples, dtype=np.float32)
+
+    def clear(self) -> None:
+        self.clears += 1
+
+
+class FakeVAD:
+    """A CommandRecorder that returns a fixed buffer without reading the source."""
+
+    def __init__(self, seconds: float = 1.0, sample_rate: int = 16000) -> None:
+        self.buffer = np.full(int(seconds * sample_rate), 0.1, dtype=np.float32)
+        self.calls = 0
+
+    def record_command(self, source: FrameSource) -> AudioSamples:
+        self.calls += 1
+        return self.buffer

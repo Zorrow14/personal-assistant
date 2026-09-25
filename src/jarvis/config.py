@@ -61,6 +61,29 @@ class Settings(BaseSettings):
     tts_voice: Path | None = None
     """Path to a Piper voice `.onnx` file (its `.onnx.json` must sit beside it)."""
 
+    # Wake word + voice-activity detection (Phase 3, `--wake`)
+    wake_word_model: str = "hey_jarvis"
+    """openWakeWord pretrained model name, or a path to a custom `.onnx` model."""
+    wake_word_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    """Score (0–1) that counts as the wake word; higher = fewer false triggers."""
+    vad_aggressiveness: int = Field(default=2, ge=0, le=3)
+    """webrtcvad strictness, 0–3; higher treats more noise as non-speech."""
+    vad_silence_ms: int = Field(default=800, gt=0)
+    """Trailing silence that ends a command."""
+    vad_frame_ms: int = 30
+    """VAD frame length; webrtcvad accepts only 10, 20 or 30 ms."""
+    command_max_seconds: float = Field(default=15.0, gt=0)
+    """Hard cap on one command's recording length."""
+    wake_chime: bool = True
+    """Play a short cue when the wake word is heard."""
+
+    @field_validator("vad_frame_ms")
+    @classmethod
+    def _check_vad_frame(cls, value: int) -> int:
+        if value not in (10, 20, 30):
+            raise ValueError("vad_frame_ms must be 10, 20 or 30")
+        return value
+
     @field_validator("llm_provider", "tts_provider", "stt_device")
     @classmethod
     def _normalise_name(cls, value: str) -> str:
