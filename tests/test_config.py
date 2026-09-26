@@ -43,7 +43,11 @@ def test_defaults() -> None:
     )
     assert settings.chroma_path == Path(".jarvis/chroma")
     assert settings.data_dir == Path(".jarvis")
-    assert (settings.rag_top_k, settings.rag_chunk_chars, settings.rag_chunk_overlap) == (5, 1000, 150)
+    assert (settings.rag_top_k, settings.rag_chunk_chars, settings.rag_chunk_overlap) == (
+        5,
+        1000,
+        150,
+    )
     assert settings.auto_index is True
 
 
@@ -64,7 +68,9 @@ def test_tool_settings_defaults() -> None:
         ("search_memory", ["search_memory"]),
     ],
 )
-def test_enabled_tools_from_env(monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]) -> None:
+def test_enabled_tools_from_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: list[str]
+) -> None:
     monkeypatch.setenv("JARVIS_ENABLED_TOOLS", raw)
     assert _settings().enabled_tools == expected
 
@@ -82,6 +88,32 @@ def test_api_key_read_from_llm_api_key_and_kept_secret(monkeypatch: pytest.Monke
     assert settings.llm_api_key is not None
     assert settings.llm_api_key.get_secret_value() == "sk-secret"
     assert "sk-secret" not in repr(settings)
+
+
+def test_ui_defaults_to_loopback() -> None:
+    settings = _settings()
+    assert (settings.ui_host, settings.ui_port) == ("127.0.0.1", 8000)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.0.0.2"])
+def test_ui_host_accepts_loopback(monkeypatch: pytest.MonkeyPatch, host: str) -> None:
+    monkeypatch.setenv("JARVIS_UI_HOST", host)
+    assert _settings().ui_host == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.20", "my-laptop.local"])
+def test_ui_host_rejects_anything_reachable_from_other_machines(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    monkeypatch.setenv("JARVIS_UI_HOST", host)
+    with pytest.raises(ValidationError, match="loopback"):
+        _settings()
+
+
+def test_ui_port_must_be_a_valid_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JARVIS_UI_PORT", "70000")
+    with pytest.raises(ValidationError):
+        _settings()
 
 
 def test_invalid_numbers_rejected(monkeypatch: pytest.MonkeyPatch) -> None:

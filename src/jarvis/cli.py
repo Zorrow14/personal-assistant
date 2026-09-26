@@ -1,12 +1,14 @@
 """Command-line entrypoint.
 
-    python -m jarvis.cli                 interactive text chat
-    python -m jarvis.cli --voice         push-to-talk voice chat
-    python -m jarvis.cli --wake          hands-free: say "Hey Jarvis", then your command
-    python -m jarvis.cli --reindex       build/refresh the memory index, then exit
-    python -m jarvis.cli --list-tools    show auto-discovered tools, then exit
-    python -m jarvis.cli --health        check config and vault, then exit
-    python -m jarvis.cli --list-devices  show audio device indices, then exit
+python -m jarvis.cli                 interactive text chat
+python -m jarvis.cli --voice         push-to-talk voice chat
+python -m jarvis.cli --wake          hands-free: say "Hey Jarvis", then your command
+python -m jarvis.cli --serve         local web panel at http://127.0.0.1:8000 (type or Talk)
+python -m jarvis.cli --serve --wake  the panel plus hands-free listening
+python -m jarvis.cli --reindex       build/refresh the memory index, then exit
+python -m jarvis.cli --list-tools    show auto-discovered tools, then exit
+python -m jarvis.cli --health        check config and vault, then exit
+python -m jarvis.cli --list-devices  show audio device indices, then exit
 """
 
 import argparse
@@ -14,13 +16,25 @@ import asyncio
 import sys
 import time
 from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
 from jarvis import __version__
 from jarvis.config import Settings, get_settings
 from jarvis.core.agent import Agent
-from jarvis.core.interfaces import AudioSamples, LLMError, RetrievalError, VoiceError
+from jarvis.core.events import LEVEL_MIC, LEVEL_SPEAKER, EventBus, LevelMeter
+from jarvis.core.interfaces import (
+    AudioSamples,
+    CommandRecorder,
+    FrameSource,
+    LLMError,
+    RetrievalError,
+    STTEngine,
+    TTSEngine,
+    VoiceError,
+    WakeWordDetector,
+)
 from jarvis.core.voice_session import EXIT_COMMANDS, TurnOutcome, VoiceSession
 from jarvis.llm.factory import create_llm_client
 from jarvis.logging import configure_logging, get_logger
@@ -29,6 +43,9 @@ from jarvis.memory.factory import build_memory
 from jarvis.memory.vault import Vault, VaultError
 from jarvis.tools.base import DuplicateToolError, ToolRegistry, discover_tool_classes
 from jarvis.tools.context import ToolContext
+
+if TYPE_CHECKING:
+    from jarvis.server.controller import PanelController
 
 log = get_logger(__name__)
 
@@ -67,7 +84,24 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="list audio devices (for JARVIS_INPUT_DEVICE / JARVIS_OUTPUT_DEVICE) and exit",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="open the local web panel (http://127.0.0.1:8000, this computer only); "
+        "add --wake for hands-free listening too",
+    )
     return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse the command line; `--serve` combines with `--wake` and nothing else."""
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.serve and any(
+        (args.health, args.voice, args.reindex, args.list_tools, args.list_devices)
+    ):
+        parser.error("--serve can only be combined with --wake")
+    return args
 
 
 def _load_settings() -> Settings | None:
@@ -81,11 +115,12 @@ def _load_settings() -> Settings | None:
     return settings
 
 
-def build_agent(settings: Settings) -> Agent:
+def build_agent(settings: Settings, *, events: EventBus | None = None) -> Agent:
     """Wire everything together: vault -> memory -> tools -> LLM client -> agent.
 
     Memory backends are created but not loaded; the embedding model and index
-    open on first use, so startup stays fast.
+    open on first use, so startup stays fast. `events` (the panel's bus) makes
+    the agent publish its tool calls.
 
     Raises:
         VaultError: If the vault path is invalid.
@@ -110,12 +145,14 @@ def build_agent(settings: Settings) -> Agent:
             indexer=memory.indexer,
             max_iterations=settings.agent_max_iterations,
             confirm_side_effects=settings.confirm_side_effects,
+            events=events,
         )
     return Agent(
         llm,
         registry,
         max_iterations=settings.agent_max_iterations,
         confirm_side_effects=settings.confirm_side_effects,
+        events=events,
     )
 
 
@@ -158,12 +195,16 @@ def run_health() -> int:
     tts = settings.tts_provider
     if tts == "piper":
         voice = settings.tts_voice
-        tts += f" ({voice})" if voice and voice.is_file() else " (voice MISSING: set JARVIS_TTS_VOICE)"
+        tts += (
+            f" ({voice})" if voice and voice.is_file() else " (voice MISSING: set JARVIS_TTS_VOICE)"
+        )
     print(f"OK  jarvis {__version__}")
     print(f"    vault:   {vault.vault_root}")
     print(f"    jarvis:  {jarvis_root} (writable)")
     print(f"    llm:     {settings.llm_provider} / {settings.llm_model}, api key {key_status}")
-    print(f"    stt:     whisper {settings.stt_model} ({settings.stt_device}, {settings.stt_compute_type})")
+    print(
+        f"    stt:     whisper {settings.stt_model} ({settings.stt_device}, {settings.stt_compute_type})"
+    )
     print(f"    tts:     {tts}")
     print(
         f"    wake:    '{settings.wake_word_model}' (threshold {settings.wake_word_threshold}), "
@@ -246,7 +287,9 @@ def run_list_tools() -> int:
         print("  " + "  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)))
     if enabled is not None:
         unknown = sorted(set(enabled) - {cls.name for cls in classes})
-        print(f"\nJARVIS_ENABLED_TOOLS whitelist is active{f'; unknown names: {unknown}' if unknown else ''}.")
+        print(
+            f"\nJARVIS_ENABLED_TOOLS whitelist is active{f'; unknown names: {unknown}' if unknown else ''}."
+        )
     for problem in problems:
         print(f"SKIPPED  {problem.where}: {problem.error}")
     return 0
@@ -343,7 +386,9 @@ def run_wake() -> int:
     try:
         agent = build_agent(settings)
         # The shared mic stream is always 16 kHz, whatever JARVIS_SAMPLE_RATE says for --voice.
-        stt = WhisperSTT.from_settings(settings.model_copy(update={"sample_rate": STREAM_SAMPLE_RATE}))
+        stt = WhisperSTT.from_settings(
+            settings.model_copy(update={"sample_rate": STREAM_SAMPLE_RATE})
+        )
         tts = create_tts_engine(settings)
         detector = OpenWakeWordDetector(settings.wake_word_model)
         recorder = VoiceActivityDetector(
@@ -379,7 +424,9 @@ def run_wake() -> int:
                     wake_phrase=wake_phrase,
                     display=_safe_print,
                 )
-                print(f"Jarvis is listening. Say '{wake_phrase}', then your command. Ctrl-C to quit.")
+                print(
+                    f"Jarvis is listening. Say '{wake_phrase}', then your command. Ctrl-C to quit."
+                )
                 runner.run(loop.run())
         except KeyboardInterrupt:
             print()
@@ -390,6 +437,179 @@ def run_wake() -> int:
             runner.run(agent.llm.aclose())
     print("Bye.")
     return 0
+
+
+def run_serve(*, wake: bool = False) -> int:
+    """The local web panel, optionally with hands-free listening. Returns a process exit code.
+
+    The panel, the agent and (with `wake`) the wake-word loop share one event
+    loop. The agent is the same one text mode uses, now publishing events.
+    """
+    settings = _load_settings()
+    if settings is None:
+        return 1
+    bus = EventBus()
+    try:
+        agent = build_agent(settings, events=bus)
+    except (VaultError, LLMError, RetrievalError, DuplicateToolError) as exc:
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+
+    with asyncio.Runner() as runner:
+        try:
+            if wake:
+                code = _serve_hands_free(settings, agent, bus, runner)
+            else:
+                code = _serve_push_to_talk(settings, agent, bus, runner)
+        except KeyboardInterrupt:
+            print()
+            code = 0
+        finally:
+            runner.run(agent.llm.aclose())
+    if code == 0:
+        print("Bye.")
+    return code
+
+
+def _serve_push_to_talk(
+    settings: Settings, agent: Agent, bus: EventBus, runner: asyncio.Runner
+) -> int:
+    """`--serve`: typing works always; Talk opens the mic for one command at a time."""
+    from jarvis.server.controller import PanelController, PushToTalkVoice
+
+    voice: PushToTalkVoice | None = None
+    voice_error: str | None = None
+    try:
+        # Voice deps are imported only when voice is used, keeping text mode light.
+        from jarvis.audio.io import STREAM_SAMPLE_RATE, MicStream
+        from jarvis.core.voice_loop import WakeWordLoop
+
+        stt, tts, recorder, chime = _build_panel_voice_io(settings, bus)
+        mic = MicStream(
+            STREAM_SAMPLE_RATE, settings.input_device, audio_listener=LevelMeter(bus, LEVEL_MIC)
+        )
+
+        def make_loop(detector: WakeWordDetector, source: FrameSource) -> WakeWordLoop:
+            # No wake word in this mode, so the loop's "listening for ..." lines stay quiet.
+            return WakeWordLoop(
+                agent, stt, tts, detector, recorder, source, chime=chime, display=_quiet, events=bus
+            )
+
+        voice = PushToTalkVoice(make_loop, mic, bus, warm_up=stt.load)
+    except (VoiceError, ValueError, OSError, ImportError) as exc:
+        voice_error = str(exc)
+        print(f"NOTE  Talk is disabled (typing still works): {exc}", file=sys.stderr)
+    controller = PanelController(agent, bus, voice=voice, voice_error=voice_error)
+    hint = "Type a command or press Talk." if voice else "Type a command."
+    return _run_panel(settings, bus, controller, runner, hint)
+
+
+def _serve_hands_free(
+    settings: Settings, agent: Agent, bus: EventBus, runner: asyncio.Runner
+) -> int:
+    """`--serve --wake`: the `--wake` loop, always listening, with the panel on top."""
+    from jarvis.audio.io import STREAM_SAMPLE_RATE, MicStream
+    from jarvis.core.voice_loop import WakeWordLoop
+    from jarvis.server.controller import HandsFreeVoice, ManualWakeTrigger, PanelController
+    from jarvis.wakeword.openwakeword_detector import OpenWakeWordDetector
+
+    try:
+        stt, tts, recorder, chime = _build_panel_voice_io(settings, bus)
+        detector = OpenWakeWordDetector(settings.wake_word_model)
+        print(f"Loading models (Whisper '{settings.stt_model}' downloads on first run)...")
+        runner.run(asyncio.to_thread(stt.load))
+        runner.run(asyncio.to_thread(detector.load))
+    except (VoiceError, ValueError) as exc:
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+
+    wake_phrase = _wake_phrase(settings.wake_word_model)
+    trigger = ManualWakeTrigger(detector)  # the panel's Talk button fires it too
+    with MicStream(
+        STREAM_SAMPLE_RATE, settings.input_device, audio_listener=LevelMeter(bus, LEVEL_MIC)
+    ) as mic:
+        loop = WakeWordLoop(
+            agent,
+            stt,
+            tts,
+            trigger,
+            recorder,
+            mic,
+            threshold=settings.wake_word_threshold,
+            chime=chime,
+            wake_phrase=wake_phrase,
+            display=_safe_print,
+            events=bus,
+        )
+        voice = HandsFreeVoice(loop, trigger, bus, wake_phrase=wake_phrase)
+        controller = PanelController(agent, bus, voice=voice)
+        return _run_panel(
+            settings, bus, controller, runner, f"Say '{wake_phrase}', type, or press Talk."
+        )
+
+
+def _build_panel_voice_io(
+    settings: Settings, bus: EventBus
+) -> tuple[STTEngine, TTSEngine, CommandRecorder, Callable[[], None] | None]:
+    """STT, TTS (metered for the orb), the end-of-speech recorder and the wake chime.
+
+    Raises:
+        VoiceError / ValueError: If a voice setting is invalid.
+    """
+    from jarvis.audio.io import STREAM_SAMPLE_RATE, play_chime
+    from jarvis.audio.vad import VoiceActivityDetector
+    from jarvis.stt.whisper_stt import WhisperSTT
+    from jarvis.tts.factory import create_tts_engine
+
+    # The shared mic stream is always 16 kHz, whatever JARVIS_SAMPLE_RATE says for --voice.
+    stt = WhisperSTT.from_settings(settings.model_copy(update={"sample_rate": STREAM_SAMPLE_RATE}))
+    tts = create_tts_engine(settings, level_listener=LevelMeter(bus, LEVEL_SPEAKER))
+    recorder = VoiceActivityDetector(
+        aggressiveness=settings.vad_aggressiveness,
+        frame_ms=settings.vad_frame_ms,
+        silence_ms=settings.vad_silence_ms,
+        max_seconds=settings.command_max_seconds,
+        sample_rate=STREAM_SAMPLE_RATE,
+    )
+
+    def chime() -> None:
+        play_chime(settings.output_device)
+
+    return stt, tts, recorder, chime if settings.wake_chime else None
+
+
+def _run_panel(
+    settings: Settings,
+    bus: EventBus,
+    controller: "PanelController",
+    runner: asyncio.Runner,
+    hint: str,
+) -> int:
+    """Bind the loopback port, print the URL and serve until Ctrl-C."""
+    from jarvis.server.app import NonLoopbackHostError, bind_loopback_socket, create_app, panel_url
+    from jarvis.server.app import serve as serve_panel
+
+    try:
+        sock = bind_loopback_socket(settings.ui_host, settings.ui_port)
+    except NonLoopbackHostError as exc:
+        print(f"FAIL  {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(
+            f"FAIL  can't listen on {settings.ui_host}:{settings.ui_port} ({exc}). Is Jarvis "
+            "already running? Set JARVIS_UI_PORT to use another port.",
+            file=sys.stderr,
+        )
+        return 1
+    app = create_app(bus, controller, port=settings.ui_port)
+    print(f"Jarvis panel: {panel_url(settings.ui_host, settings.ui_port)}  (this computer only)")
+    print(f"{hint} Side-effect actions ask y/N here in this terminal. Ctrl-C to quit.")
+    runner.run(serve_panel(app, sock, log_level=settings.log_level))
+    return 0
+
+
+def _quiet(_line: str) -> None:
+    """A `display` that shows nothing (the panel is the display)."""
 
 
 def _wake_phrase(model: str) -> str:
@@ -463,7 +683,9 @@ def _voice_chat(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments and dispatch. Returns a process exit code."""
-    args = _build_parser().parse_args(argv)
+    args = parse_args(argv)
+    if args.serve:
+        return run_serve(wake=args.wake)
     if args.health:
         return run_health()
     if args.list_devices:

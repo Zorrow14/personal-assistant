@@ -6,6 +6,7 @@ wake-word detection.
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
@@ -76,16 +77,46 @@ def record_until_enter(
     return audio
 
 
-def play(audio: np.ndarray, sample_rate: int, device: int | None = None) -> None:
-    """Play a sample buffer and block until playback finishes."""
+def play(
+    audio: np.ndarray,
+    sample_rate: int,
+    device: int | None = None,
+    *,
+    level_listener: Callable[[np.ndarray], None] | None = None,
+) -> None:
+    """Play a sample buffer and block until playback finishes.
+
+    Args:
+        level_listener: If given, receives each 50 ms block of `audio`, paced
+            to real time while it plays (drives the panel's orb).
+    """
     sd.play(audio, samplerate=sample_rate, device=device)
+    if level_listener is not None:
+        _report_blocks_while_playing(audio, sample_rate, level_listener)
     sd.wait()
 
 
-def play_wav(path: str | Path, device: int | None = None) -> None:
+def play_wav(
+    path: str | Path,
+    device: int | None = None,
+    *,
+    level_listener: Callable[[np.ndarray], None] | None = None,
+) -> None:
     """Load a WAV file and play it, blocking until finished."""
     data, sample_rate = sf.read(str(path), dtype="float32")
-    play(data, sample_rate, device)
+    play(data, sample_rate, device, level_listener=level_listener)
+
+
+def _report_blocks_while_playing(
+    audio: np.ndarray, sample_rate: int, listener: Callable[[np.ndarray], None]
+) -> None:
+    block = max(1, sample_rate // 20)
+    started = time.perf_counter()
+    for offset in range(0, len(audio), block):
+        listener(audio[offset : offset + block])
+        ahead = started + (offset + block) / sample_rate - time.perf_counter()
+        if ahead > 0:
+            time.sleep(ahead)
 
 
 def list_devices() -> str:
@@ -109,16 +140,20 @@ class MicStream:
         device: int | None = None,
         *,
         read_timeout: float = 3.0,
+        audio_listener: Callable[[AudioSamples], None] | None = None,
     ) -> None:
         """
         Args:
             sample_rate: Capture rate in Hz.
             device: Input device index; None for the system default.
             read_timeout: Seconds without any audio before `read` gives up.
+            audio_listener: Also receives every captured block, on the audio
+                thread (e.g. a level meter). Must be quick and must not raise.
         """
         self.sample_rate = sample_rate
         self._device = device
         self._read_timeout = read_timeout
+        self._audio_listener = audio_listener
         self._chunks: queue.Queue[AudioSamples] = queue.Queue()
         self._pending: AudioSamples = np.zeros(0, dtype=np.float32)
         self._stream: sd.InputStream | None = None
@@ -184,10 +219,15 @@ class MicStream:
             except queue.Empty:
                 return
 
-    def _on_audio(self, indata: np.ndarray, frames: int, time: object, status: sd.CallbackFlags) -> None:
+    def _on_audio(
+        self, indata: np.ndarray, frames: int, time: object, status: sd.CallbackFlags
+    ) -> None:
         if status:
             log.warning("audio.input_status", status=str(status))
-        self._chunks.put(indata[:, 0].copy())
+        block = indata[:, 0].copy()
+        self._chunks.put(block)
+        if self._audio_listener is not None:
+            self._audio_listener(block)
 
 
 def chime_samples(sample_rate: int = CHIME_SAMPLE_RATE) -> AudioSamples:

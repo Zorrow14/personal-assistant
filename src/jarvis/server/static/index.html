@@ -1,0 +1,576 @@
+<!doctype html>
+<!--
+  Jarvis panel: one self-contained page (inline CSS + JS, no external requests).
+  It is a thin client: everything it shows comes from events on /ws, and it
+  sends back only {cmd:"text", text}, {cmd:"talk"} and {cmd:"stop"}.
+  TODO(phase-6+): a Tauri shell or Next.js front end can wrap this page as-is;
+  it only needs same-origin access to /ws.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Jarvis</title>
+<link id="favicon" rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #05070a;
+    --bg-raised: #0a0e13;
+    --line: #18202a;
+    --line-strong: #243140;
+    --text: #cdd6e1;
+    --text-dim: #6f7d8d;
+    --text-faint: #3b4755;
+    --idle: #4cc9f0;
+    --listening: #37e39a;
+    --thinking: #a78bfa;
+    --speaking: #5aa9ff;
+    --error: #ff5d6c;
+    --warn: #f2b84b;
+    --accent: var(--idle);
+    --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "SF Mono",
+      Consolas, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
+    background:
+      radial-gradient(ellipse 70% 60% at 35% 45%, rgba(76, 201, 240, 0.05), transparent 70%),
+      radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.035) 1px, transparent 0) 0 0 / 22px 22px,
+      var(--bg);
+    color: var(--text);
+    font: 13px/1.55 var(--mono);
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input { font: inherit; color: inherit; }
+
+  /* ---- header -------------------------------------------------------- */
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: rgba(5, 7, 10, 0.7); backdrop-filter: blur(6px);
+  }
+  .brand { display: flex; align-items: baseline; gap: 12px; min-width: 0; flex: 1 1 auto; }
+  .brand h1 {
+    margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.42em; color: #e8eef5;
+  }
+  .brand .ver { color: var(--text-faint); font-size: 11px; }
+  .chip {
+    border: 1px solid var(--line-strong); border-radius: 999px; padding: 1px 9px;
+    color: var(--text-dim); font-size: 10.5px; letter-spacing: 0.12em; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+  .conn { display: flex; align-items: center; gap: 8px; flex-shrink: 0; font-size: 11px; letter-spacing: 0.14em; color: var(--text-dim); white-space: nowrap; }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); }
+  .conn[data-status="live"] { color: var(--listening); }
+  .conn[data-status="live"] .dot { background: var(--listening); box-shadow: 0 0 10px var(--listening); }
+  .conn[data-status="connecting"] .dot, .conn[data-status="retry"] .dot {
+    background: var(--warn); animation: blink 1s steps(2, start) infinite;
+  }
+  .conn[data-status="retry"] { color: var(--warn); }
+  @keyframes blink { to { visibility: hidden; } }
+
+  /* ---- main ---------------------------------------------------------- */
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 440px); min-height: 0; }
+  .stage {
+    position: relative; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 6px; padding: 16px; min-height: 0;
+  }
+  #orb { width: min(64vmin, 540px); height: min(64vmin, 540px); display: block; }
+  .state-label {
+    margin-top: -8px; font-size: 13px; font-weight: 600; letter-spacing: 0.5em;
+    color: var(--accent); transition: color 0.4s ease; text-indent: 0.5em;
+  }
+  .state-hint { color: var(--text-dim); font-size: 12px; min-height: 1.6em; text-align: center; }
+
+  .log-wrap { display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--line); background: rgba(10, 14, 19, 0.55); }
+  .log-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    color: var(--text-faint); font-size: 10.5px; letter-spacing: 0.2em;
+  }
+  .log-head button {
+    background: none; border: 0; color: var(--text-faint); cursor: pointer; letter-spacing: 0.14em; font-size: 10.5px; padding: 0;
+  }
+  .log-head button:hover { color: var(--text-dim); }
+  #log { flex: 1; overflow-y: auto; padding: 10px 16px 16px; scroll-behavior: smooth; }
+  #log:empty::before {
+    content: "Nothing yet. Type a command below to start."; color: var(--text-faint); display: block; padding-top: 8px;
+  }
+  .entry {
+    display: grid; grid-template-columns: 58px 58px minmax(0, 1fr); gap: 0 8px;
+    padding: 5px 0; border-bottom: 1px dashed rgba(36, 49, 64, 0.45); animation: in 0.25s ease-out;
+  }
+  @keyframes in { from { opacity: 0; transform: translateY(3px); } }
+  .entry .t { color: var(--text-faint); font-size: 11px; padding-top: 1px; }
+  .entry .k { font-size: 10.5px; letter-spacing: 0.12em; padding-top: 1px; }
+  .entry .m { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .entry.you .k { color: var(--idle); }
+  .entry.jarvis .k { color: var(--thinking); }
+  .entry.jarvis .m { color: #e9eef4; }
+  .entry.tool .k { color: var(--warn); }
+  .entry.error .k, .entry.error .m { color: var(--error); }
+  .entry.notice .k, .entry.notice .m { color: var(--text-dim); }
+  .tool-name { color: #e9eef4; }
+  .status { margin-left: 8px; font-size: 10.5px; letter-spacing: 0.1em; }
+  .status.started { color: var(--warn); }
+  .status.completed { color: var(--listening); }
+  .status.declined { color: var(--text-dim); }
+  .status.error { color: var(--error); }
+  .detail { color: var(--text-dim); font-size: 11.5px; margin-top: 2px; }
+
+  /* ---- composer ------------------------------------------------------ */
+  footer { border-top: 1px solid var(--line); padding: 12px 20px 10px; background: rgba(5, 7, 10, 0.8); }
+  form { display: flex; gap: 8px; align-items: stretch; }
+  .field {
+    flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0;
+    border: 1px solid var(--line-strong); border-radius: 8px; padding: 0 12px; background: var(--bg-raised);
+  }
+  .field:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+  .prompt { color: var(--accent); }
+  #text { flex: 1; min-width: 0; background: none; border: 0; outline: none; padding: 11px 0; }
+  #text::placeholder { color: var(--text-faint); }
+  .btn {
+    border: 1px solid var(--line-strong); border-radius: 8px; background: var(--bg-raised);
+    padding: 0 16px; cursor: pointer; letter-spacing: 0.08em; white-space: nowrap;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--accent); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn:focus-visible, .log-head button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #talk.active { border-color: var(--listening); color: var(--listening); background: rgba(55, 227, 154, 0.08); }
+  #stop { padding: 0 13px; }
+  .fine { margin-top: 7px; color: var(--text-faint); font-size: 11px; }
+  .fine kbd { border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 4px; font: inherit; }
+
+  @media (max-width: 820px) {
+    main { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+    #orb { width: min(46vh, 86vw); height: min(46vh, 86vw); }
+    .log-wrap { border-left: 0; border-top: 1px solid var(--line); }
+    header, footer { padding-left: 16px; padding-right: 16px; }
+    .brand .ver { display: none; }
+    .btn { padding: 0 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .entry { animation: none; }
+    #log { scroll-behavior: auto; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>JARVIS</h1>
+    <span class="ver" id="version"></span>
+    <span class="chip" id="mode">CONNECTING</span>
+  </div>
+  <div class="conn" id="conn" data-status="connecting" role="status" aria-live="polite">
+    <span class="dot"></span><span id="conn-label">CONNECTING</span>
+  </div>
+</header>
+
+<main>
+  <section class="stage" aria-label="Assistant state">
+    <canvas id="orb" aria-hidden="true"></canvas>
+    <div class="state-label" id="state-label" aria-live="polite">OFFLINE</div>
+    <div class="state-hint" id="state-hint">Connecting to Jarvis…</div>
+  </section>
+  <section class="log-wrap" aria-label="Conversation">
+    <div class="log-head"><span>LOG</span><button type="button" id="clear">CLEAR</button></div>
+    <div id="log" role="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<footer>
+  <form id="composer" autocomplete="off">
+    <label class="field">
+      <span class="prompt">›</span>
+      <input id="text" maxlength="4000" placeholder="Type a command…" aria-label="Command" spellcheck="false">
+    </label>
+    <button class="btn" type="submit" id="send">Send</button>
+    <button class="btn" type="button" id="talk" title="Speak one command">🎤 Talk</button>
+    <button class="btn" type="button" id="stop" title="Stop listening (Esc)" aria-label="Stop listening">■</button>
+  </form>
+  <!-- TODO(phase-6+): approve side-effect tools here instead of in the terminal. -->
+  <div class="fine">Actions with side effects (like saving a reminder) ask <kbd>y/N</kbd> in the terminal running Jarvis. <kbd>Esc</kbd> stops listening.</div>
+</footer>
+
+<script>
+"use strict";
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log"), input = $("text"), talkBtn = $("talk"), stopBtn = $("stop");
+
+  const COLORS = {
+    idle: [76, 201, 240], listening: [55, 227, 154], thinking: [167, 139, 250],
+    speaking: [90, 169, 255], error: [255, 93, 108], offline: [84, 96, 110],
+  };
+  const LABELS = { idle: "IDLE", listening: "LISTENING", thinking: "THINKING", speaking: "SPEAKING", offline: "OFFLINE" };
+  const ERROR_FLASH_MS = 2500;
+  const MAX_ENTRIES = 400;
+
+  let state = "offline";
+  let info = { voice: false, hands_free: false, wake_phrase: null };
+  let errorUntil = 0;
+  const levels = { mic: { value: 0, at: -1e9 }, speaker: { value: 0, at: -1e9 } };
+  const toolRows = new Map();
+
+  // ---- connection --------------------------------------------------------
+  let ws = null, attempt = 0;
+
+  function connect() {
+    setConn("connecting", "CONNECTING");
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${scheme}://${location.host}/ws`);
+    ws = socket;
+    socket.onopen = () => { attempt = 0; setConn("live", "LIVE"); };
+    socket.onmessage = (msg) => {
+      let event;
+      try { event = JSON.parse(msg.data); } catch { return; }
+      handle(event);
+    };
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      ws = null;
+      setState("offline");
+      const delay = Math.min(5000, 500 * 2 ** attempt++);
+      setConn("retry", `RECONNECTING IN ${Math.ceil(delay / 1000)}s`);
+      setTimeout(connect, delay);
+    };
+  }
+
+  function send(command) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(command));
+      return true;
+    }
+    addEntry("notice", "SYS", "Not connected yet; retrying…");
+    return false;
+  }
+
+  function setConn(status, label) {
+    $("conn").dataset.status = status;
+    $("conn-label").textContent = label;
+  }
+
+  // ---- events ------------------------------------------------------------
+  function handle(event) {
+    const d = event.data || {};
+    switch (event.type) {
+      case "hello": applyHello(d); break;
+      case "state": setState(d.state); break;
+      case "transcript":
+        if (d.text) addEntry("you", "YOU", d.source === "voice" ? `🎙 ${d.text}` : d.text);
+        else addEntry("notice", "SYS", "Didn't catch that. Try again.");
+        break;
+      case "reply": addEntry("jarvis", "JARVIS", d.text); break;
+      case "tool": upsertTool(d); break;
+      case "level": {
+        const slot = levels[d.source];
+        if (slot) { slot.value = normLevel(d.rms); slot.at = performance.now(); }
+        break;
+      }
+      case "error":
+        addEntry("error", "ERROR", d.message);
+        errorUntil = performance.now() + ERROR_FLASH_MS;
+        render();
+        setTimeout(render, ERROR_FLASH_MS + 50);
+        break;
+      case "notice": addEntry("notice", "SYS", d.message); break;
+      default: break; // unknown types are ignored (newer server, e.g. reminders)
+    }
+  }
+
+  function applyHello(d) {
+    info = d;
+    $("version").textContent = d.version ? `v${d.version}` : "";
+    $("mode").textContent = d.hands_free
+      ? `HANDS-FREE · “${(d.wake_phrase || "Hey Jarvis").toUpperCase()}”`
+      : d.voice ? "PUSH-TO-TALK" : "TEXT ONLY";
+    talkBtn.disabled = !d.voice;
+    talkBtn.title = d.voice ? "Speak one command" : `Voice unavailable: ${d.voice_error || "not set up"}`;
+    if (d.max_text_chars) input.maxLength = d.max_text_chars;
+    setState(d.state || "idle");
+  }
+
+  function setState(next) {
+    state = LABELS[next] ? next : "idle";
+    render();
+  }
+
+  // Label, accent colour and favicon; an error shows for a moment over any state.
+  function render() {
+    const erroring = performance.now() < errorUntil;
+    const shown = erroring ? "error" : state;
+    document.documentElement.style.setProperty("--accent", `rgb(${COLORS[shown].join(",")})`);
+    $("state-label").textContent = erroring ? "ERROR" : LABELS[state];
+    $("state-hint").textContent = erroring ? "Something went wrong; see the log." : hintFor(state);
+    talkBtn.classList.toggle("active", state === "listening");
+    stopBtn.disabled = state !== "listening";
+    drawFavicon(COLORS[shown]);
+  }
+
+  function hintFor(s) {
+    if (s === "offline") return "Disconnected; reconnecting…";
+    if (s === "listening") return "Go ahead. Stop talking to send, or press Esc to cancel.";
+    if (s === "thinking") return "Working on it…";
+    if (s === "speaking") return "Speaking…";
+    if (info.hands_free) return `Say “${info.wake_phrase || "Hey Jarvis"}”, type a command, or press Talk.`;
+    return info.voice ? "Type a command or press Talk." : "Type a command.";
+  }
+
+  // ---- log ---------------------------------------------------------------
+  function clock() {
+    return new Date().toLocaleTimeString([], { hour12: false });
+  }
+
+  function addEntry(kind, tag, text) {
+    const row = document.createElement("div");
+    row.className = `entry ${kind}`;
+    const t = document.createElement("span"); t.className = "t"; t.textContent = clock();
+    const k = document.createElement("span"); k.className = "k"; k.textContent = tag;
+    const m = document.createElement("div"); m.className = "m"; m.textContent = text ?? "";
+    row.append(t, k, m);
+    append(row);
+    return m;
+  }
+
+  function append(row) {
+    const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
+    logEl.append(row);
+    while (logEl.childElementCount > MAX_ENTRIES) logEl.firstElementChild.remove();
+    if (nearBottom) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  const STATUS_TEXT = { started: "running…", completed: "done", declined: "declined", error: "failed" };
+
+  function upsertTool(d) {
+    let entry = toolRows.get(d.id);
+    if (!entry || !entry.row.isConnected) {
+      const m = addEntry("tool", "TOOL", "");
+      const name = document.createElement("span"); name.className = "tool-name";
+      const status = document.createElement("span");
+      const args = document.createElement("div"); args.className = "detail";
+      const result = document.createElement("div"); result.className = "detail";
+      m.append(name, status, args, result);
+      entry = { row: m.parentElement, name, status, args, result };
+      toolRows.set(d.id, entry);
+    }
+    entry.name.textContent = d.name;
+    entry.status.className = `status ${d.status}`;
+    entry.status.textContent = STATUS_TEXT[d.status] || d.status;
+    entry.args.textContent = truncate(compactJson(d.args), 220);
+    entry.result.textContent = d.result ? `→ ${truncate(d.result, 220)}` : "";
+  }
+
+  function compactJson(value) {
+    try { return JSON.stringify(value ?? {}); } catch { return String(value); }
+  }
+
+  function truncate(text, n) {
+    const s = String(text).replace(/\s+/g, " ");
+    return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+  }
+
+  // ---- controls ----------------------------------------------------------
+  $("composer").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    if (send({ cmd: "text", text })) input.value = "";
+  });
+  talkBtn.addEventListener("click", () => send({ cmd: "talk" }));
+  stopBtn.addEventListener("click", () => send({ cmd: "stop" }));
+  $("clear").addEventListener("click", () => { logEl.replaceChildren(); toolRows.clear(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && state === "listening") send({ cmd: "stop" });
+  });
+
+  // ---- favicon mirrors the state ----------------------------------------
+  const fav = document.createElement("canvas");
+  fav.width = fav.height = 32;
+  function drawFavicon([r, g, b]) {
+    const c = fav.getContext("2d");
+    c.clearRect(0, 0, 32, 32);
+    const grad = c.createRadialGradient(12, 11, 2, 16, 16, 15);
+    grad.addColorStop(0, `rgb(${Math.min(255, r + 90)},${Math.min(255, g + 90)},${Math.min(255, b + 90)})`);
+    grad.addColorStop(1, `rgb(${r},${g},${b})`);
+    c.fillStyle = grad;
+    c.beginPath(); c.arc(16, 16, 13, 0, Math.PI * 2); c.fill();
+    $("favicon").href = fav.toDataURL("image/png");
+  }
+
+  // ---- the orb -----------------------------------------------------------
+  const canvas = $("orb");
+  const ctx = canvas.getContext("2d");
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let W = 0, H = 0, DPR = 1;
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = canvas.width = Math.max(1, Math.round(rect.width * DPR));
+    H = canvas.height = Math.max(1, Math.round(rect.height * DPR));
+  }
+  new ResizeObserver(resize).observe(canvas);
+  resize();
+
+  // Loudness in dBFS mapped to 0..1: quiet room ≈ 0.1, normal speech ≈ 0.7-1.
+  function normLevel(rms) {
+    const db = 20 * Math.log10((rms || 0) + 1e-5);
+    return Math.max(0, Math.min(1, (db + 58) / 42));
+  }
+
+  function freshLevel(source, now) {
+    const slot = levels[source];
+    return now - slot.at < 350 ? slot.value : null;
+  }
+
+  // Stand-in speech envelope for voices we can't meter (the OS voice).
+  function syntheticSpeech(t) {
+    return 0.35 + 0.4 * Math.abs(Math.sin(t * 7.3) * Math.sin(t * 2.9 + 1.1));
+  }
+
+  function targetsFor(s, t, level) {
+    switch (s) {
+      case "listening": return { amp: 0.05 + level * 0.32, scale: 1 + level * 0.12, spin: 0.35, flow: 0.9 + level * 2.5, glow: 0.55 + level * 0.45, arcs: 0, ring: level };
+      case "thinking":  return { amp: 0.06, scale: 1 + 0.025 * Math.sin(t * 3.2), spin: 2.6, flow: 2.6, glow: 0.65, arcs: 1, ring: 0 };
+      case "speaking":  return { amp: 0.05 + level * 0.28, scale: 1 + level * 0.09, spin: 0.55, flow: 1.2 + level * 2.2, glow: 0.55 + level * 0.4, arcs: 0, ring: level * 0.8 };
+      case "error":     return { amp: 0.09, scale: 1 + 0.015 * Math.sin(t * 40), spin: 0, flow: 3.5, glow: 0.8, arcs: 0, ring: 0.3 };
+      case "offline":   return { amp: 0.012, scale: 0.9, spin: 0.05, flow: 0.2, glow: 0.12, arcs: 0, ring: 0 };
+      default:          return { amp: 0.028, scale: 1 + 0.035 * Math.sin(t * 1.25), spin: 0.12, flow: 0.45, glow: 0.42 + 0.08 * Math.sin(t * 1.25), arcs: 0, ring: 0 };
+    }
+  }
+
+  const cur = { color: [...COLORS.offline], amp: 0.012, scale: 0.9, spin: 0.05, flow: 0.2, glow: 0.12, arcs: 0, ring: 0 };
+  let level = 0, phase = 0, angle = 0, last = performance.now();
+  const start = last;
+
+  const ease = (from, to, rate, dt) => from + (to - from) * (1 - Math.exp(-rate * dt));
+  const rgba = ([r, g, b], a) => `rgba(${r | 0},${g | 0},${b | 0},${Math.max(0, Math.min(1, a)).toFixed(3)})`;
+  const lighten = ([r, g, b], f) => [r + (255 - r) * f, g + (255 - g) * f, b + (255 - b) * f];
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    const t = (now - start) / 1000;
+    const shown = now < errorUntil ? "error" : state;
+
+    let target = 0;
+    if (shown === "listening") target = freshLevel("mic", now) ?? 0;
+    if (shown === "speaking") target = freshLevel("speaker", now) ?? syntheticSpeech(t);
+    level = ease(level, target, target > level ? 22 : 7, dt);
+
+    const goal = targetsFor(shown, t, level);
+    const speed = reduceMotion ? 0.25 : 1;
+    cur.color = cur.color.map((c, i) => ease(c, COLORS[shown][i], 5, dt));
+    for (const key of ["amp", "scale", "spin", "flow", "glow", "arcs", "ring"]) {
+      cur[key] = ease(cur[key], goal[key], key === "amp" || key === "ring" ? 14 : 4, dt);
+    }
+    phase += dt * cur.flow * speed;
+    angle += dt * cur.spin * speed;
+
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    const cx = W / 2, cy = H / 2;
+    const R = Math.min(W, H) * 0.25 * cur.scale;
+    const col = cur.color;
+
+    // Halo, fading out before the canvas edge so it never shows a square.
+    const halo = ctx.createRadialGradient(cx, cy, R * 0.5, cx, cy, Math.min(R * 2.2, Math.min(W, H) / 2));
+    halo.addColorStop(0, rgba(col, 0.32 * cur.glow));
+    halo.addColorStop(0.45, rgba(col, 0.1 * cur.glow));
+    halo.addColorStop(1, rgba(col, 0));
+    ctx.fillStyle = halo;
+    ctx.fillRect(0, 0, W, H);
+
+    // Faint instrument rings with tick marks.
+    ctx.lineWidth = DPR;
+    ctx.strokeStyle = rgba(col, 0.1 + 0.08 * cur.glow);
+    ring(cx, cy, R * 1.62);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle * 0.15);
+    for (let i = 0; i < 72; i++) {
+      const a = (i / 72) * Math.PI * 2, long = i % 6 === 0;
+      const r1 = R * 1.62, r2 = R * (long ? 1.7 : 1.66);
+      ctx.strokeStyle = rgba(col, long ? 0.3 * cur.glow + 0.05 : 0.14 * cur.glow);
+      ctx.beginPath(); ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1); ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2); ctx.stroke();
+    }
+    ctx.restore();
+
+    // Level ring: expands with the voice.
+    if (cur.ring > 0.02) {
+      ctx.lineWidth = 1.5 * DPR;
+      ctx.strokeStyle = rgba(col, 0.55 * cur.ring);
+      ring(cx, cy, R * (1.12 + cur.ring * 0.34));
+    }
+
+    // Thinking arcs.
+    if (cur.arcs > 0.02) {
+      ctx.lineCap = "round";
+      for (let k = 0; k < 3; k++) {
+        const dir = k % 2 ? -1 : 1, r = R * (1.24 + k * 0.11), a0 = angle * dir * (1 + k * 0.35) + k * 2.1;
+        ctx.lineWidth = (2.4 - k * 0.6) * DPR;
+        ctx.strokeStyle = rgba(col, (0.75 - k * 0.2) * cur.arcs);
+        ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + Math.PI * (0.42 + 0.14 * k)); ctx.stroke();
+      }
+    }
+
+    // The body: three soft, wobbling layers blended additively.
+    ctx.globalCompositeOperation = "lighter";
+    for (let layer = 0; layer < 3; layer++) {
+      ctx.beginPath();
+      const steps = 128;
+      for (let i = 0; i <= steps; i++) {
+        const a = (i / steps) * Math.PI * 2;
+        const n =
+          0.5 * Math.sin(a * 3 + phase * (1 + layer * 0.35) + layer * 2.1) +
+          0.3 * Math.sin(a * 5 - phase * 1.6 + layer) +
+          0.2 * Math.sin(a * 2 + phase * 0.7 + layer * 4.2);
+        const r = R * (1 - layer * 0.07) * (1 + cur.amp * n * (1 + layer * 0.3));
+        const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      const fill = ctx.createRadialGradient(cx - R * 0.28, cy - R * 0.32, R * 0.04, cx, cy, R * 1.08);
+      fill.addColorStop(0, rgba(lighten(col, 0.6), 0.5 / (layer + 1)));
+      fill.addColorStop(0.5, rgba(col, 0.3 / (layer + 1)));
+      fill.addColorStop(1, rgba(col, 0.03));
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.lineWidth = 1.1 * DPR;
+      ctx.strokeStyle = rgba(lighten(col, 0.25), 0.45 / (layer + 1));
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = "source-over";
+
+    // Core.
+    const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 0.45);
+    core.addColorStop(0, rgba(lighten(col, 0.85), 0.5 * cur.glow + 0.1));
+    core.addColorStop(1, rgba(col, 0));
+    ctx.fillStyle = core;
+    ctx.beginPath(); ctx.arc(cx, cy, R * 0.45, 0, Math.PI * 2); ctx.fill();
+  }
+
+  function ring(cx, cy, r) {
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+  }
+
+  setState("offline");
+  requestAnimationFrame(frame);
+  connect();
+  input.focus();
+})();
+</script>
+</body>
+</html>

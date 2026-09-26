@@ -16,6 +16,17 @@ from collections.abc import Callable
 from enum import Enum
 
 from jarvis.core.agent import Agent
+from jarvis.core.events import (
+    ERROR,
+    REPLY,
+    STATE,
+    STATE_IDLE,
+    STATE_LISTENING,
+    STATE_SPEAKING,
+    STATE_THINKING,
+    TRANSCRIPT,
+    EventBus,
+)
 from jarvis.core.interfaces import (
     AudioSamples,
     CommandRecorder,
@@ -91,6 +102,7 @@ class WakeWordLoop:
         wake_phrase: str = "Hey Jarvis",
         display: Callable[[str], None] = print,
         on_state: Callable[[LoopState], None] | None = None,
+        events: EventBus | None = None,
     ) -> None:
         """
         Args:
@@ -104,7 +116,9 @@ class WakeWordLoop:
             chime: Plays the wake cue (blocking); None for silent triggers.
             wake_phrase: Shown in the idle prompt.
             display: Where status lines, transcripts and replies are shown.
-            on_state: Called on every state change (e.g. for a future GUI).
+            on_state: Called on every state change.
+            events: Where to publish state/transcript/reply/error events (e.g.
+                for the web panel); None publishes nothing.
         """
         self.agent = agent
         self.stt = stt
@@ -116,6 +130,7 @@ class WakeWordLoop:
         self._wake_phrase = wake_phrase
         self._display = display
         self._on_state = on_state
+        self._events = events
         self._stop = threading.Event()
         self._source = _StoppableSource(source, self._stop)
         self.state: LoopState | None = None
@@ -133,15 +148,18 @@ class WakeWordLoop:
             while not self._stop.is_set():
                 try:
                     result = await self.run_once()
-                except VoiceError:
+                except VoiceError as exc:
+                    self._publish(ERROR, message=f"Voice error: {exc}")
                     raise
                 except Exception as exc:
                     failures += 1
                     if isinstance(exc, LLMError):
                         self._display(f"jarvis> [LLM error] {exc}")
+                        self._publish(ERROR, message=f"LLM error: {exc}")
                     else:
                         log.exception("voice_loop.turn_failed")
                         self._display(f"jarvis> [error] {type(exc).__name__}: {exc}")
+                        self._publish(ERROR, message=f"{type(exc).__name__}: {exc}")
                     if failures >= MAX_CONSECUTIVE_FAILURES:
                         raise
                     continue
@@ -179,6 +197,7 @@ class WakeWordLoop:
 
         self._enter(LoopState.PROCESSING)
         transcript = (await self.stt.transcribe_async(audio)).strip()
+        self._publish(TRANSCRIPT, text=transcript, source="voice")
         if not transcript:
             self._display(NOT_HEARD_MESSAGE.format(wake_phrase=self._wake_phrase))
             self._enter(LoopState.IDLE)
@@ -189,6 +208,7 @@ class WakeWordLoop:
 
         reply = await self.agent.run(transcript)
         self._display(f"jarvis> {reply}")
+        self._publish(REPLY, text=reply)
 
         self._enter(LoopState.SPEAKING)
         # TODO(phase-3+): barge-in, i.e. keep detecting the wake word while
@@ -218,7 +238,24 @@ class WakeWordLoop:
         self._display(_STATUS[state].format(wake_phrase=self._wake_phrase))
         if self._on_state is not None:
             self._on_state(state)
+        self._publish(STATE, state=event_state(state))
 
+    def _publish(self, type_: str, **data: object) -> None:
+        if self._events is not None:
+            self._events.emit(type_, **data)
+
+
+def event_state(state: LoopState | None) -> str:
+    """The `state` event value for a loop state (None, i.e. not started yet, counts as idle)."""
+    return _EVENT_STATE[state] if state is not None else STATE_IDLE
+
+
+_EVENT_STATE = {
+    LoopState.IDLE: STATE_IDLE,
+    LoopState.LISTENING: STATE_LISTENING,
+    LoopState.PROCESSING: STATE_THINKING,
+    LoopState.SPEAKING: STATE_SPEAKING,
+}
 
 _STATUS = {
     LoopState.IDLE: "\n🟢 listening for '{wake_phrase}'…",

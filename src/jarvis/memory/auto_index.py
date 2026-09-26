@@ -10,6 +10,7 @@ writer, the tools, or the agent loop. It's an `Agent` subclass, so the text,
 import asyncio
 
 from jarvis.core.agent import Agent, ConfirmFn
+from jarvis.core.events import EventBus
 from jarvis.core.interfaces import LLMClient
 from jarvis.logging import get_logger
 from jarvis.memory.indexer import Snapshot, VaultIndexer
@@ -30,6 +31,7 @@ class AutoIndexingAgent(Agent):
         max_iterations: int = 8,
         confirm: ConfirmFn | None = None,
         confirm_side_effects: bool = True,
+        events: EventBus | None = None,
     ) -> None:
         """Same arguments as `Agent`, plus the `indexer` to update after each turn."""
         super().__init__(
@@ -38,6 +40,7 @@ class AutoIndexingAgent(Agent):
             max_iterations=max_iterations,
             confirm=confirm,
             confirm_side_effects=confirm_side_effects,
+            events=events,
         )
         self.indexer = indexer
 

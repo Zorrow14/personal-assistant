@@ -1,5 +1,6 @@
 """Typed application settings, loaded from environment variables and `.env`."""
 
+import ipaddress
 import json
 import logging
 from functools import lru_cache
@@ -109,6 +110,24 @@ class Settings(BaseSettings):
     file_sandbox_root: Path | None = None
     """The only folder `read_local_file` may read under; None = the vault folder."""
 
+    # Local web panel (Phase 6A, `--serve`)
+    ui_host: str = "127.0.0.1"
+    """Address the panel listens on. Loopback only (127.0.0.1, ::1, localhost): Jarvis
+    runs tools and hears the mic, so it must never be reachable from other machines."""
+    ui_port: int = Field(default=8000, ge=1, le=65535)
+
+    @field_validator("ui_host")
+    @classmethod
+    def _require_loopback(cls, value: str) -> str:
+        host = value.strip()
+        if not is_loopback_host(host):
+            raise ValueError(
+                f"ui_host must be a loopback address (127.0.0.1, ::1 or localhost), got {value!r}. "
+                "The panel can run tools and hears the mic, so it must never be reachable "
+                "from other machines."
+            )
+        return host
+
     @field_validator("enabled_tools", mode="before")
     @classmethod
     def _split_tool_list(cls, value: object) -> object:
@@ -164,6 +183,17 @@ class Settings(BaseSettings):
         if level not in logging.getLevelNamesMapping():
             raise ValueError(f"unknown log level: {value!r}")
         return level
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for "localhost" and loopback IPs (127.0.0.0/8, ::1). False for all else, incl. 0.0.0.0."""
+    name = host.strip().lower()
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
 
 
 @lru_cache(maxsize=1)

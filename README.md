@@ -4,10 +4,11 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 5 (extensible tools).** Type a command, use push-to-talk, or
-just say "Hey Jarvis" and speak. The LLM (Google Gemini) decides which tool to
-call, Jarvis runs it and answers in text or aloud, and each task is journaled to
-the vault.
+**Status: Phase 6A (local panel).** Type a command, use push-to-talk, or
+just say "Hey Jarvis" and speak, in the terminal or in a local browser panel
+with a live voice orb. The LLM (Google Gemini) decides which tool to call,
+Jarvis runs it and answers in text or aloud, and each task is journaled to the
+vault.
 
 Jarvis can also:
 - search its own history and cite past notes as `[[note_name]]`
@@ -23,7 +24,7 @@ The wake word (openWakeWord), end-of-speech detection (webrtcvad),
 speech-to-text (faster-whisper), text-to-speech (Piper, or the OS voice) and
 the memory index (fastembed + Chroma) all run locally and cost nothing. Not
 built yet, and marked `TODO(phase-N)` in the code: barge-in, reminder alerts,
-account-connected tools (Gmail and Calendar) and a GUI.
+metrics, account-connected tools (Gmail and Calendar) and a packaged desktop app.
 
 ## Requirements
 
@@ -81,6 +82,8 @@ directory you run Jarvis from.
 | `JARVIS_SEARCH_MAX_RESULTS` | no | `5` | Default number of web search results. |
 | `JARVIS_REMINDERS_PATH` | no | `.jarvis/reminders.json` | Where reminders are saved. It's local and git-ignored. |
 | `JARVIS_FILE_SANDBOX_ROOT` | no | vault folder | The only folder `read_local_file` may read under. |
+| `JARVIS_UI_HOST` | no | `127.0.0.1` | Where `--serve` listens. **Loopback only** (`127.0.0.1`, `::1`, `localhost`). Anything else, including `0.0.0.0`, is rejected at startup. |
+| `JARVIS_UI_PORT` | no | `8000` | Port for `--serve`. |
 
 `.env` is git-ignored. Never commit real keys.
 
@@ -105,6 +108,8 @@ from the Gemini calls.
 uv run python -m jarvis.cli                 # text chat; type exit or quit, or press Ctrl-C, to leave
 uv run python -m jarvis.cli --voice         # push-to-talk voice chat
 uv run python -m jarvis.cli --wake          # hands-free: "Hey Jarvis", then your command
+uv run python -m jarvis.cli --serve         # local panel at http://127.0.0.1:8000: type or press Talk
+uv run python -m jarvis.cli --serve --wake  # the panel plus hands-free listening
 uv run python -m jarvis.cli --reindex       # build/refresh the memory index over existing notes
 uv run python -m jarvis.cli --list-tools    # auto-discovered tools and their confirmation flags
 uv run python -m jarvis.cli --health        # check config + vault, then exit
@@ -139,6 +144,41 @@ Example:
 you> log that I finished the vault module
 jarvis> Logged it — "Finish the vault module" is in your vault.
 ```
+
+### Local panel (`--serve`)
+
+`--serve` starts Jarvis with a browser panel. Open the URL it prints, which is
+<http://127.0.0.1:8000> by default.
+
+- **The orb** follows what Jarvis is doing. It pulses slowly when idle, reacts
+  to your voice while listening, spins while thinking, and reacts to its own
+  voice while speaking. It flashes red on an error.
+- **The log** streams what you said or typed, every tool call with its status
+  (running, done, declined, failed), its arguments and its result, and every reply.
+- **Typing** runs the same agent as text mode. Typed replies are shown, not spoken.
+- **🎤 Talk** records one spoken command. Recording stops when you stop talking;
+  the reply is shown and spoken. Esc, or ■, abandons a recording.
+
+With `--serve` alone, the microphone opens only while you're using Talk. With
+`--serve --wake`, it listens for "Hey Jarvis" all the time, exactly as `--wake`
+does, and the Talk button works like saying the wake word. If voice isn't set up
+(for example, no Piper voice), `--serve` still starts: typing works and Talk
+explains what's missing.
+
+Tools with side effects still ask `y/N` **in the terminal** where Jarvis is
+running. The panel waits until you answer there. Closing the tab, or typing
+"exit", leaves Jarvis running; press Ctrl-C in the terminal to stop it.
+
+**Local only, by design.** The panel can run tools and hear your mic, so it has
+no login and must never be reachable from another machine:
+
+- It only binds a loopback address. A non-loopback `JARVIS_UI_HOST`, such as
+  `0.0.0.0`, is refused at startup.
+- Requests whose `Host` isn't loopback are refused, which blocks DNS rebinding.
+- A browser WebSocket must come from the panel's own origin, so other websites
+  open in your browser can't connect to it and give Jarvis commands.
+- The page is one self-contained file with no CDN and no external requests. It is
+  served with a strict Content-Security-Policy and can't be framed.
 
 `--health` loads the settings, creates `<vault>/Jarvis/` if it is missing, checks
 that the folder is writable, and prints `OK` with the resolved vault path and the
@@ -184,6 +224,21 @@ window still holds "Hey Jarvis" and fires again immediately (a measured score of
 0.98 without the flush, 0.00 with it). The loop reports LLM errors and failed
 turns and keeps listening, but it stops after 3 failures in a row rather than
 spinning on a broken device.
+
+The panel attaches to all of this through an event bus, `core/events.py`. When
+they're given a bus, the agent publishes `tool` events and the wake-word loop
+publishes `state`, `transcript`, `reply` and `error` events. A level meter on
+the mic stream, and on Piper's playback, publishes `level` events at most 20
+times a second. Without a bus, as in every CLI mode, nothing is published and
+nothing changes. Publishing never blocks: each open panel gets its own bounded
+queue, and a slow tab only loses its own oldest events.
+
+`server/app.py` runs FastAPI in the same event loop as the assistant and forwards
+events to each tab over `/ws`. `server/controller.py` turns the panel's commands
+into actions. Typing calls `Agent.run` exactly as text mode does, and Talk fires
+a manual wake-word trigger on the existing `WakeWordLoop`. Because of that, a
+voice turn looks the same in every mode. `Agent.run` queues concurrent calls, so
+a typed command and a spoken one never interleave in the history.
 
 ### Memory (retrieval)
 
@@ -270,12 +325,17 @@ so nothing is overwritten.
 src/jarvis/
 ├── config.py             Settings (pydantic-settings)
 ├── logging.py            structlog setup + get_logger()
-├── cli.py                entrypoint: modes, --reindex, --list-tools, --health, wiring
+├── cli.py                entrypoint: modes, --serve, --reindex, --list-tools, --health, wiring
 ├── core/
 │   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types
+│   ├── events.py         EventBus, the event vocabulary, LevelMeter
 │   ├── agent.py          tool-calling loop + confirmation gate
 │   ├── voice_session.py  one push-to-talk turn: transcribe -> agent -> speak
 │   └── voice_loop.py     hands-free state machine (IDLE/LISTENING/PROCESSING/SPEAKING)
+├── server/               the local panel (--serve)
+│   ├── app.py            FastAPI app: /, /health, /ws; loopback-only bind, Host/Origin checks
+│   ├── controller.py     panel commands (text/talk/stop) -> agent and voice loop
+│   └── static/index.html the panel: one self-contained page with the canvas orb
 ├── audio/
 │   ├── io.py             mic (Enter-to-stop recording, shared MicStream), playback, chime
 │   └── vad.py            webrtcvad end-of-command detection
@@ -317,5 +377,5 @@ To add a voice engine, implement `STTEngine` or `TTSEngine` and add a branch to
 ## Roadmap
 
 - **Phase 5.5:** account-connected tools (Gmail, Calendar) behind OAuth, with stricter confirmation. See `tools/_TODO_connected_tools.md`.
-- **Phase 6:** a GUI, and a scheduler that actually alerts you when reminders are due.
-- **Later:** barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
+- **Phase 6B:** a scheduler that actually alerts you when reminders are due (a `reminder` event for the panel), metrics on `/health`, and error hardening (timeouts, cancelling a request).
+- **Later:** a packaged desktop app (Tauri or Next.js) around the same panel page; approving side-effect tools from the panel instead of the terminal; barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.

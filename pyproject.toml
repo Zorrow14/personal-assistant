@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.9",
     "ddgs>=9.16.0",
+    "fastapi>=0.141.1",
     "fastembed>=0.8.1",
     "faster-whisper>=1.2.1",
     "google-genai>=2.25.0",
@@ -23,6 +24,7 @@ dependencies = [
     "sounddevice>=0.5.6",
     "soundfile>=0.14.0",
     "structlog>=26.1.0",
+    "uvicorn[standard]>=0.54.0",
     "webrtcvad-wheels>=2.0.14",
 ]
 
@@ -42,6 +44,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+filterwarnings = [
+    # Starlette's TestClient nudges towards the optional `httpx2` package; httpx works fine.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
 
 [tool.ruff]
 target-version = "py312"
