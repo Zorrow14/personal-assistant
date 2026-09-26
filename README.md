@@ -1,469 +1,201 @@
-# Jarvis
+# Jarvis — a local-first, voice-driven personal AI assistant
 
-A voice-driven personal assistant that interprets natural-language commands, acts
-on them through LLM tool-calling, speaks its replies, and journals every task into
-an Obsidian vault as plain Markdown.
+> An assistant that **acts** on natural-language commands, **speaks** its replies,
+> **remembers** everything it does in a plain-text Obsidian vault, and runs
+> **entirely on your own machine**.
 
-**Status: Phase 6.5 (desktop app).** Type a command, use push-to-talk, or just
-say "Hey Jarvis" and speak: in the terminal, in a local browser panel with a
-live voice orb, or in a desktop app (tray icon, global hotkey) that wraps that
-panel. The LLM (Google Gemini) decides
-which tool to call, Jarvis runs it and answers in text or aloud, and each task
-is journaled to the vault. Every turn's latency and token use is recorded
-locally, and a failed turn gets an apology instead of a crash.
+Not a chatbot wrapper. Jarvis is an agentic assistant with a real tool-calling
+loop, hands-free wake-word activation, retrieval-augmented memory over its own
+work history, an extensible plugin system, and a reactive local UI — built in
+seven independently-shippable phases, with every external dependency behind a
+swappable interface.
 
-Jarvis can also:
-- search its own history and cite past notes as `[[note_name]]`
-- search the web
-- tell the date and time
-- save reminders (it asks you first) and announce them when they're due
-- read text files, but only from inside your vault
+<!-- Replace with a real capture -->
+![demo](docs/demo.gif)
 
-Tools are plugins: a new capability is one new file in `src/jarvis/tools/`. See
-[docs/writing-a-tool.md](docs/writing-a-tool.md).
-
-The wake word (openWakeWord), end-of-speech detection (webrtcvad),
-speech-to-text (faster-whisper), text-to-speech (Piper, or the OS voice) and
-the memory index (fastembed + Chroma) all run locally and cost nothing. Not
-built yet, and marked `TODO(phase-N)` in the code: barge-in, cancelling a
-request mid-flight, account-connected tools (Gmail and Calendar), approving
-side-effect actions from the panel, and signing/auto-update for the desktop app.
-
-## Requirements
-
-- [uv](https://docs.astral.sh/uv/). It installs Python 3.12 for the project if needed.
-- An Obsidian vault folder, or any existing folder you want to use as one.
-- A free Gemini API key from <https://aistudio.google.com/apikey>.
-
-## Setup
-
-```sh
-uv sync                  # create .venv and install dependencies
-cp .env.example .env     # PowerShell: Copy-Item .env.example .env
-```
-
-Then edit `.env` and set `JARVIS_VAULT_PATH` and `LLM_API_KEY`.
-
-### Environment variables
-
-Variables are read from the process environment first, then from `.env` in the
-directory you run Jarvis from.
-
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `JARVIS_VAULT_PATH` | yes | – | Root of your Obsidian vault. Must already exist. Jarvis writes only under `<vault>/Jarvis/`. |
-| `LLM_API_KEY` | for chat | – | Gemini API key. Held as a secret, so it is never logged. `JARVIS_LLM_API_KEY` also works. |
-| `JARVIS_LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. Use `WARNING` for a quiet chat. |
-| `JARVIS_LLM_PROVIDER` | no | `gemini` | Which `LLMClient` to use. Only `gemini` exists so far. |
-| `JARVIS_LLM_MODEL` | no | `gemini-2.5-flash` | Model name, as listed in AI Studio. |
-| `JARVIS_LLM_MAX_TOKENS` | no | `1024` | Output token cap per reply. |
-| `JARVIS_LLM_TEMPERATURE` | no | `0.7` | Sampling temperature, from 0 to 2. |
-| `JARVIS_AGENT_MAX_ITERATIONS` | no | `8` | Maximum LLM round-trips per command. |
-| `JARVIS_SAMPLE_RATE` | no | `16000` | Microphone rate in Hz. Whisper needs 16 kHz; other rates are resampled. |
-| `JARVIS_INPUT_DEVICE` / `JARVIS_OUTPUT_DEVICE` | no | system default | Device indices from `--list-devices`. |
-| `JARVIS_STT_MODEL` | no | `base.en` | faster-whisper model size (`tiny.en`, `base.en`, `small.en`, ...). |
-| `JARVIS_STT_DEVICE` | no | `cpu` | `cpu`, or `cuda` for an NVIDIA GPU. |
-| `JARVIS_STT_COMPUTE_TYPE` | no | `int8` | `int8` for CPU, `float16` for GPU. |
-| `JARVIS_TTS_PROVIDER` | no | `piper` | `piper` (neural voice, needs a voice file) or `pyttsx3` (OS voice, no setup). |
-| `JARVIS_TTS_VOICE` | for piper | – | Path to a Piper `.onnx` voice. Its `.onnx.json` must sit beside it. |
-| `JARVIS_WAKE_WORD_MODEL` | no | `hey_jarvis` | openWakeWord pretrained model name, or a path to a custom `.onnx`. |
-| `JARVIS_WAKE_WORD_THRESHOLD` | no | `0.5` | Wake score, from 0 to 1. Higher means fewer false triggers but more misses. |
-| `JARVIS_VAD_AGGRESSIVENESS` | no | `2` | webrtcvad strictness, 0–3. Raise it in noisy rooms. |
-| `JARVIS_VAD_SILENCE_MS` | no | `800` | Trailing silence that ends a command. Raise it if you get cut off. |
-| `JARVIS_VAD_FRAME_MS` | no | `30` | VAD frame length: 10, 20 or 30 ms. |
-| `JARVIS_COMMAND_MAX_SECONDS` | no | `15` | Hard cap on one command's length. |
-| `JARVIS_WAKE_CHIME` | no | `true` | Play a short cue when the wake word is heard. |
-| `JARVIS_EMBEDDER_PROVIDER` | no | `local` | Embedding backend. Only `local` (on-device fastembed) exists, so note text never leaves the machine. |
-| `JARVIS_EMBED_MODEL` | no | `BAAI/bge-small-en-v1.5` | fastembed model. It downloads once (about 70 MB) into `.jarvis/fastembed`. Changing it rebuilds the index. |
-| `JARVIS_VECTOR_STORE` | no | `chroma` | Vector store. Only `chroma` (embedded, on disk) exists. |
-| `JARVIS_CHROMA_PATH` | no | `.jarvis/chroma` | Where the index lives, relative to where you run Jarvis. The manifest and model cache sit next to it. |
-| `JARVIS_RAG_TOP_K` | no | `5` | Chunks `search_memory` retrieves by default. |
-| `JARVIS_RAG_CHUNK_CHARS` / `JARVIS_RAG_CHUNK_OVERLAP` | no | `1000` / `150` | Chunk size and overlap in characters. Changing either rebuilds the index. |
-| `JARVIS_AUTO_INDEX` | no | `true` | Index notes written during a turn straight after it, so they're searchable immediately. |
-| `JARVIS_ENABLED_TOOLS` | no | all | Comma-separated whitelist of tool names (see `--list-tools`). Leave empty to enable every discovered tool. |
-| `JARVIS_CONFIRM_SIDE_EFFECTS` | no | `true` | Ask y/N before any tool with a side effect runs. Turning it off prints a warning at startup and logs every bypass. |
-| `JARVIS_SEARCH_MAX_RESULTS` | no | `5` | Default number of web search results. |
-| `JARVIS_REMINDERS_PATH` | no | `.jarvis/reminders.json` | Where reminders are saved. It's local and git-ignored. |
-| `JARVIS_FILE_SANDBOX_ROOT` | no | vault folder | The only folder `read_local_file` may read under. |
-| `JARVIS_UI_HOST` | no | `127.0.0.1` | Where `--serve` listens. **Loopback only** (`127.0.0.1`, `::1`, `localhost`). Anything else, including `0.0.0.0`, is rejected at startup. |
-| `JARVIS_UI_PORT` | no | `8000` | Port for `--serve`. |
-| `JARVIS_METRICS_PATH` | no | `.jarvis/metrics.jsonl` | Where per-turn metrics go: one JSON line per turn with stage latencies, LLM requests and tokens. Local only. |
-| `JARVIS_METRICS_ENABLED` | no | `true` | Set to `false` to stop writing metrics. The panel's metrics strip still works. |
-| `JARVIS_REMINDER_POLL_SECONDS` | no | `30` | How often the scheduler checks for due reminders (in `--wake` and `--serve`). |
-| `JARVIS_REMINDER_NOTIFY` | no | `tts` | How a due reminder is delivered: `tts` (spoken), `toast` (desktop notification) or `both`. The panel always shows it. |
-
-`.env` is git-ignored. Never commit real keys.
-
-### Voice setup
-
-Download a Piper voice into `voices/` (git-ignored):
-
-```sh
-uv run python -m piper.download_voices en_US-lessac-medium --download-dir voices
-```
-
-Then set `JARVIS_TTS_VOICE=voices/en_US-lessac-medium.onnx`. To skip this step,
-set `JARVIS_TTS_PROVIDER=pyttsx3` and Jarvis will use the built-in OS voice.
-
-The first `--voice` run downloads the Whisper model: about 145 MB for `base.en`,
-cached under `~/.cache/huggingface`. After that, voice mode works offline, apart
-from the Gemini calls.
-
-## Run
-
-```sh
-uv run python -m jarvis.cli                 # text chat; type exit or quit, or press Ctrl-C, to leave
-uv run python -m jarvis.cli --voice         # push-to-talk voice chat
-uv run python -m jarvis.cli --wake          # hands-free: "Hey Jarvis", then your command
-uv run python -m jarvis.cli --serve         # local panel at http://127.0.0.1:8000: type or press Talk
-uv run python -m jarvis.cli --serve --wake  # the panel plus hands-free listening
-uv run python -m jarvis.cli --reindex       # build/refresh the memory index over existing notes
-uv run python -m jarvis.cli --list-tools    # auto-discovered tools and their confirmation flags
-uv run python -m jarvis.cli --health        # check config + vault, then exit
-uv run python -m jarvis.cli --list-devices  # audio device indices
-uv run python -m jarvis.cli --metrics       # latency percentiles per stage, LLM requests and tokens
-uv run python eval/run.py --fake            # tool-selection eval, scripted and offline (for CI)
-uv run python eval/run.py                   # the same eval against your configured LLM
-uv run pytest                               # offline: fakes for LLM/STT/TTS/wake/VAD/memory, temp vault, no mic
-```
-
-In hands-free mode (`--wake`), no keys are needed:
-
-1. Say **"Hey Jarvis"** and wait for the chime.
-2. Say your command, then stop talking. Recording ends after 0.8 s of silence.
-3. Jarvis shows the transcript, runs the command, and speaks the reply.
-4. It goes back to listening for the wake word.
-
-Say "Hey Jarvis… exit", or press Ctrl-C, to quit. The wake-word model ships
-with openWakeWord, so there is nothing extra to download. While Jarvis is
-speaking it doesn't listen for the wake word, and anything the mic picks up
-during that time, including Jarvis's own voice, is thrown away.
-
-In push-to-talk mode (`--voice`):
-
-1. Press **Enter** and speak.
-2. Press **Enter** again to stop recording.
-3. Jarvis shows the transcript, runs the command, prints the reply and says it aloud.
-
-You can also type a message at the prompt instead of speaking; the reply is
-still spoken. To leave, say or type "exit" or "quit", or press Ctrl-C.
-
-Example:
-
-```
-you> log that I finished the vault module
-jarvis> Logged it — "Finish the vault module" is in your vault.
-```
-
-### Local panel (`--serve`)
-
-`--serve` starts Jarvis with a browser panel. Open the URL it prints, which is
-<http://127.0.0.1:8000> by default.
-
-- **The orb** follows what Jarvis is doing. It pulses slowly when idle, reacts
-  to your voice while listening, spins while thinking, and reacts to its own
-  voice while speaking. It flashes red on an error.
-- **The log** streams what you said or typed, every tool call with its status
-  (running, done, declined, failed), its arguments and its result, and every reply.
-- **Typing** runs the same agent as text mode. Typed replies are shown, not spoken.
-- **🎤 Talk** records one spoken command. Recording stops when you stop talking;
-  the reply is shown and spoken. Esc, or ■, abandons a recording.
-
-With `--serve` alone, the microphone opens only while you're using Talk. With
-`--serve --wake`, it listens for "Hey Jarvis" all the time, exactly as `--wake`
-does, and the Talk button works like saying the wake word. If voice isn't set up
-(for example, no Piper voice), `--serve` still starts: typing works and Talk
-explains what's missing.
-
-Tools with side effects still ask `y/N` **in the terminal** where Jarvis is
-running. The panel waits until you answer there. Closing the tab, or typing
-"exit", leaves Jarvis running; press Ctrl-C in the terminal to stop it.
-
-**Local only, by design.** The panel can run tools and hear your mic, so it has
-no login and must never be reachable from another machine:
-
-- It only binds a loopback address. A non-loopback `JARVIS_UI_HOST`, such as
-  `0.0.0.0`, is refused at startup.
-- Requests whose `Host` isn't loopback are refused, which blocks DNS rebinding.
-- A browser WebSocket must come from the panel's own origin, so other websites
-  open in your browser can't connect to it and give Jarvis commands.
-- The page is one self-contained file with no CDN and no external requests. It is
-  served with a strict Content-Security-Policy and can't be framed.
-
-### Desktop app (`desktop/`)
-
-The same panel in a native window (Tauri v2): a tray icon, a global hotkey
-(<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd>) that brings it up from any app, and the
-backend started and stopped for you. Closing the window keeps Jarvis in the tray;
-*Quit* in the tray menu stops everything. It's local-only, like `--serve`.
-
-```powershell
-cd desktop
-npm install
-npm run dev      # develop: the app, with the backend running in this repo
-npm run build    # a Windows installer (NSIS), backend included
-```
-
-The backend is `jarvis --serve` frozen by PyInstaller into one `.exe`
-(`packaging/jarvis-backend.spec`, entrypoint `src/jarvis/sidecar.py`). It still
-reads `.env`, `.jarvis/` and voices from a folder you choose, not from the binary.
-The app has no terminal, so side-effect actions that would ask `y/N` are declined.
-Prerequisites, settings (port, hotkey, wake word, data folder), the icon and
-troubleshooting are in [desktop/README.md](desktop/README.md).
-
-### Reminders
-
-Ask for one ("remind me to stretch in 10 minutes") and confirm the `y/N` prompt.
-While Jarvis is running with `--wake` or `--serve`, a scheduler checks
-`.jarvis/reminders.json` every 30 seconds. When a reminder is due, Jarvis:
-
-- shows it in the panel and prints it in the terminal;
-- says "Reminder: stretch" aloud, waiting for any conversation in progress to
-  finish, and not listening for the wake word while it speaks;
-- optionally shows a desktop notification (`JARVIS_REMINDER_NOTIFY=toast` or `both`).
-
-A reminder is marked delivered in the file before it's announced, so it's never
-repeated, not even after a crash or restart. Reminders that came due while
-Jarvis wasn't running are delivered at startup, saying when they were due.
-Text chat and `--voice` don't run the scheduler.
-
-### Metrics and evaluation
-
-Every turn, in every mode, appends one line to `.jarvis/metrics.jsonl`:
-
-- **Timings:** `wake_to_stt` (the chime plus you speaking), `stt`, `llm_total`
-  (all LLM requests, summed), `tool_total`, `tts` and `total`.
-- **Usage:** LLM requests and input/output tokens, as Gemini reports them.
-- **Also recorded:** tool calls and errors, the outcome, and the model name.
-
-`--metrics` and `GET /metrics` summarise the file: p50/p95 per stage, totals,
-and which stage dominates Jarvis's own time. The panel shows the last turn's
-timings and the session totals under the orb. Nothing leaves your machine.
-
-`eval/run.py` is a small regression check for tool selection, useful when
-switching models. Each case in `eval/cases.json` gives an input and the tool it
-should trigger, for example "what time is it" should call `get_datetime`, and
-optionally text the reply must contain. Cases run through the real agent and
-tools on a throwaway vault in a temp folder, never your own; web search is
-canned with `--fake`. `--fake` uses a scripted LLM, needs no network or key,
-and fits CI. Without it, the eval runs against the model in your `.env` and
-prints a pass/fail table and score. It exits 1 below `--min-score`, which
-defaults to 1.0.
-
-### When something fails
-
-A turn that fails after the wake word never takes Jarvis down. This covers
-recording, STT, the LLM, a tool and TTS. The error appears in the panel and the
-log, Jarvis says "Sorry, something went wrong.", and it goes back to listening.
-If the free tier's rate limit wins after the retries, it says it's being
-rate-limited instead. A tool that raises is reported back to the model as an
-error, so the model can explain or retry. If the `y/N` prompt itself fails, the
-action is declined, never run. Only a persistent fault, 3 failures in a row
-such as an unplugged mic, stops the loop.
-
-`--health` loads the settings, creates `<vault>/Jarvis/` if it is missing, checks
-that the folder is writable, and prints `OK` with the resolved vault path and the
-LLM settings. It never calls the LLM. It exits non-zero if anything fails.
-
-## How it works
-
-1. `cli.py` builds everything in one place: Settings, then logging, then an
-   `LLMClient` chosen by `llm_provider`, then a `ToolRegistry`, then the `Agent`.
-2. `Agent.run` sends the conversation and the tool schemas to the LLM. If the
-   model asks for tools, the agent validates each call's arguments against the
-   tool's pydantic model, runs the tool, adds the result to the conversation and
-   asks the model again. It stops when the model replies in text, or after
-   `agent_max_iterations` round-trips.
-3. Tools with `requires_confirmation = True` ask `Allow? [y/N]` in the terminal
-   before they run. Unknown tools, bad arguments and tool exceptions are sent
-   back to the model as errors; they don't crash the chat.
-4. The conversation history lives on the Agent, so follow-up questions have context.
-
-The agent works only with the neutral types in `core/interfaces.py`. Everything
-specific to Gemini lives in `llm/gemini_client.py`: role mapping, function
-declarations, finish reasons, and retries. The client retries 429 and 5xx errors
-up to 5 times, waiting 1, 2, 4 and then 8 seconds.
-
-Voice is a thin layer around the same `Agent.run`. `core/voice_session.py`
-transcribes the recording (`STTEngine`), calls the agent exactly as text mode
-does, and speaks the reply (`TTSEngine`), with Markdown symbols removed first.
-Blocking model and audio work runs through `asyncio.to_thread`. Each engine's
-vendor code stays in its own module: `stt/whisper_stt.py`,
-`tts/piper_tts.py`, `tts/system_tts.py` and `audio/io.py`.
-
-Hands-free mode adds a small state machine, `core/voice_loop.py`:
-
-```
-IDLE ──wake word──▶ LISTENING ──silence or cap──▶ PROCESSING ──text──▶ SPEAKING ──▶ IDLE
-                                                       └── empty transcript ──▶ IDLE
-```
-
-One 16 kHz `MicStream` feeds both consumers. The wake detector reads it in
-80 ms frames and the VAD in 30 ms frames. After a trigger, the detector is
-reset and fed a moment of silence. Without that, openWakeWord's rolling feature
-window still holds "Hey Jarvis" and fires again immediately (a measured score of
-0.98 without the flush, 0.00 with it). The loop reports LLM errors and failed
-turns and keeps listening, but it stops after 3 failures in a row rather than
-spinning on a broken device.
-
-The panel attaches to all of this through an event bus, `core/events.py`. When
-they're given a bus, the agent publishes `tool` events and the wake-word loop
-publishes `state`, `transcript`, `reply` and `error` events. A level meter on
-the mic stream, and on Piper's playback, publishes `level` events at most 20
-times a second. Without a bus, as in every CLI mode, nothing is published and
-nothing changes. Publishing never blocks: each open panel gets its own bounded
-queue, and a slow tab only loses its own oldest events.
-
-`server/app.py` runs FastAPI in the same event loop as the assistant and forwards
-events to each tab over `/ws`. `server/controller.py` turns the panel's commands
-into actions. Typing calls `Agent.run` exactly as text mode does, and Talk fires
-a manual wake-word trigger on the existing `WakeWordLoop`. Because of that, a
-voice turn looks the same in every mode. `Agent.run` queues concurrent calls, so
-a typed command and a spoken one never interleave in the history.
-
-### Memory (retrieval)
-
-Run `--reindex` once to index your existing notes. After that:
-
-- **`search_memory`** is a read-only tool. It embeds the question and finds the
-  nearest note chunks. It returns one entry per note: the `[[note_name]]`, the
-  date, the tags, a relevance score and a snippet. It also states today's date
-  so the model can work out relative dates like "last week". The model is told
-  to answer only from these results and to say so when nothing fits.
-- **Indexing** reads everything under `<vault>/Jarvis/`. The text it embeds for
-  each note is the frontmatter `command` plus the note body. That text is split
-  into chunks with ids like `Tasks/<file>.md::0`, so re-indexing replaces chunks
-  rather than duplicating them.
-- **The manifest** (`.jarvis/index_manifest.json`) keeps a content hash for each
-  note. Unchanged notes are skipped, edited notes are re-embedded (stale chunks
-  are removed), and deleted notes are dropped. If the embedding model, the
-  chunking settings or the vault change, the whole index is rebuilt.
-- **Auto-index:** `AutoIndexingAgent` is a subclass of `Agent`. It records each
-  note's size and modified time before a turn, then indexes whatever changed
-  once the turn is done. A task you log now can be found in the very next turn,
-  in every mode, without touching the vault writer or the tools.
-
-### Tools (plugins)
-
-| Tool | Category | Asks first? | What it does |
-|---|---|---|---|
-| `write_task_note` | vault | no | Logs a task note to `<vault>/Jarvis/Tasks/`. |
-| `search_memory` | memory | no | Semantic search over past notes. |
-| `web_search` | web | no | Searches DuckDuckGo via `ddgs`, with no API key. Returns titles, snippets and URLs. |
-| `get_datetime` | time | no | The current local date, time and timezone. |
-| `set_reminder` | time | **yes** | Saves a reminder, parsing times like "tomorrow at 9am" or "in 2 hours". Announced when due in `--wake` / `--serve` (see [Reminders](#reminders)). |
-| `list_reminders` | time | no | Lists saved reminders and flags overdue ones. |
-| `read_local_file` | files | no | Reads a text file **only from inside the sandbox**, which is the vault by default. The path is resolved first (following `..`, symlinks and junctions), and anything that lands outside is refused. |
-
-- **Discovery.** `ToolRegistry.discover()` imports every module in
-  `jarvis.tools` and registers each concrete `Tool` subclass. It skips names
-  that start with `_` and abstract bases, and refuses to start if two tools
-  share a name.
-- **Dependencies.** Each tool gets what it needs through `from_context(ToolContext)`,
-  which exposes the vault, memory, settings and clock. The CLI never lists
-  tools one by one.
-- **Broken plugins.** A tool that fails to import or build is skipped and shown
-  under "SKIPPED" in `--list-tools`. It never takes Jarvis down.
-- **The safety gate.** Any tool with `requires_confirmation = True` shows a
-  boxed prompt with the tool, its category and its arguments, then asks
-  `y/N`. Only an explicit `y` or `yes` approves. In `--voice` and `--wake`
-  modes you answer at the keyboard.
-
-## Vault layout
-
-```
-<vault>/Jarvis/
-├── Tasks/  YYYY-MM-DD-HHMM-<slug>.md   one note per task
-└── Daily/  YYYY-MM-DD.md               timestamped log lines
-```
-
-A task note looks like this:
-
-```markdown
----
-date: 2026-09-25
-command: "Turn on the living room lights"
-status: completed
-tags: [home, lights]
-tools_used: [smart_home]
 ---
 
-# Turn on the living room lights
+## Why it's interesting
 
-Switched on 3 lights.
+Most "AI assistant" projects are a thin call to one vendor's API. This one is
+built like a system:
 
-Related: [[Living Room]]
+- **Interface-driven, vendor-swappable core.** The LLM, speech-to-text,
+  text-to-speech, wake-word, embedder, and vector store each sit behind a small
+  abstract interface. Switching from cloud Gemini to a local model — or from
+  Chroma to pgvector — is a one-file change, not a rewrite. The project ships on
+  Gemini's free tier and can go fully offline without touching the agent.
+- **Local-first by design.** Wake-word detection, speech-to-text, embeddings,
+  and the vector store all run on-device. Nothing leaves the machine except the
+  command text sent to the LLM — and the whole thing can be made 100% offline.
+  The UI binds to `127.0.0.1` only.
+- **Memory that's transparent.** Every task Jarvis performs is written as a
+  linked Markdown note in an Obsidian vault — a human-browsable audit log that
+  *doubles* as the corpus for semantic retrieval. One store, two jobs.
+- **Engineered, not just working.** A confirmation gate guards every
+  side-effecting action, a path-sandbox contains all filesystem access, a
+  regression-eval harness catches tool-selection drift when models are swapped,
+  and per-stage latency + token usage are logged for every turn.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    WW["Wake word<br/>(openWakeWord)"] --> STT["Speech-to-text<br/>(faster-whisper)"]
+    STT --> AG
+    UI["Local UI / CLI"] --> AG
+    subgraph core["Orchestrator"]
+      AG["Agent<br/>tool-calling loop"] --> LLM["Brain<br/>(Gemini · swappable)"]
+      LLM --> AG
+      AG --> TOOLS["Tools<br/>(auto-discovered plugins)"]
+    end
+    TOOLS --> VAULT["Obsidian vault<br/>(Markdown memory)"]
+    TOOLS --> RAG["RAG retrieval<br/>(fastembed + Chroma)"]
+    VAULT --> RAG
+    AG --> TTS["Text-to-speech<br/>(Piper)"]
+    TTS --> UI
+    core -. events .-> UI
 ```
 
-Every path goes through a guard, `Vault._safe_path`, that resolves `..` and
-symlinks. Any write that would land outside `<vault>/Jarvis/` raises
-`VaultPathError`. If two notes share a name, the new one gets a numeric suffix
-so nothing is overwritten.
+Every box behind an interface is replaceable. The orchestrator emits an event
+stream (state / transcript / tool / reply / audio-level) that any UI subscribes
+to — which is why the interface evolved from a terminal to a localhost web panel
+to a desktop app without the core ever changing.
 
-## Project layout
+---
+
+## Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| Language / tooling | Python 3.12, `uv` |
+| Config / schemas | Pydantic v2, pydantic-settings |
+| Observability | structlog, per-turn metrics (JSONL), regression eval harness |
+| Brain (LLM) | Google Gemini (free tier) behind an `LLMClient` interface |
+| Agent | Custom async tool-calling loop (no framework) |
+| Speech-to-text | faster-whisper (local) |
+| Text-to-speech | Piper (local neural voice) / OS voice fallback |
+| Wake word / VAD | openWakeWord ("hey_jarvis"), webrtcvad |
+| Memory | Obsidian vault (Markdown) |
+| Retrieval | fastembed (ONNX embeddings) + Chroma (local vector store) |
+| UI | FastAPI + WebSocket → localhost panel (canvas orb) → Tauri desktop shell |
+
+---
+
+## Features
+
+- **Three ways to talk to it** — text REPL, push-to-talk voice, and hands-free
+  "Hey Jarvis" always-listening mode.
+- **Acts, not just chats** — writes task notes, searches its own memory, searches
+  the web, tells the time, sets reminders that fire, reads sandboxed local files.
+- **Remembers its work** — ask *"what did I do about the wake-word module last
+  week?"* and it retrieves the real notes and answers from them.
+- **Extensible in one file** — dropping a new `Tool` subclass into `tools/`
+  auto-registers it; no edits to the agent, registry, or CLI.
+- **Safe by construction** — side-effecting tools require confirmation; all file
+  access is path-sandboxed; the UI is loopback-only.
+- **Observable** — every turn logs stage latencies and token usage; a `--metrics`
+  view and `/metrics` endpoint aggregate them.
+
+---
+
+## Getting started
+
+### Prerequisites
+- Python 3.12 and [`uv`](https://docs.astral.sh/uv/)
+- A free Gemini API key from [Google AI Studio](https://aistudio.google.com)
+- (Voice) PortAudio — `brew install portaudio` / `apt install portaudio19-dev`;
+  bundled in the pip wheel on Windows
+- An Obsidian vault folder (or any folder — Obsidian itself is optional to run)
+
+### Setup
+```bash
+git clone https://github.com/Zorrow14/jarvis.git
+cd jarvis
+uv sync
+cp .env.example .env      # then edit it (see below)
+```
+
+Set in `.env`:
+```
+LLM_API_KEY=your_gemini_key
+LLM_MODEL=gemini-2.5-flash
+VAULT_PATH=/path/to/your/vault
+TTS_PROVIDER=piper
+TTS_VOICE=voices/en_GB-alan-medium.onnx
+```
+
+### Run
+```bash
+uv run python -m jarvis.cli               # text REPL
+uv run python -m jarvis.cli --voice       # push-to-talk
+uv run python -m jarvis.cli --wake        # hands-free "Hey Jarvis"
+uv run python -m jarvis.cli --reindex     # build the memory index (run once)
+uv run python -m jarvis.cli --serve       # local web panel at 127.0.0.1:8000
+uv run python -m jarvis.cli --list-tools  # show discovered tools
+uv run python -m jarvis.cli --metrics     # latency / token summary
+```
+
+---
+
+## How it was built
+
+Seven phases, each a working milestone on its own:
+
+| Phase | What it added |
+| --- | --- |
+| 0 | Foundations — scaffolding, config, logging, vault writer, interfaces |
+| 1 | Text brain + first tool (the agentic MVP) |
+| 2 | Voice — speech-to-text + text-to-speech (push-to-talk) |
+| 3 | Wake word + always-listening loop |
+| 4 | RAG memory over the Obsidian vault |
+| 5 | Extensible plugin tool system |
+| 6 | Local UI (reactive orb) + MLOps polish (metrics, eval, resilience) |
+| 6.5 | Tauri desktop app (tray + global hotkey) |
+
+---
+
+## Skills demonstrated
+
+Agentic LLM tool-calling · retrieval-augmented generation · interface-driven
+architecture and dependency inversion · real-time audio pipelines · local model
+inference · evaluation harness design · latency/cost observability · secure
+tool-execution boundaries · full-stack (FastAPI + WebSocket + canvas UI) ·
+desktop packaging.
+
+---
+
+## Project structure
 
 ```
 src/jarvis/
-├── config.py             Settings (pydantic-settings)
-├── logging.py            structlog setup + get_logger()
-├── cli.py                entrypoint: modes, --serve, --metrics, --reindex, --list-tools, wiring
-├── notifications.py      best-effort desktop toasts (plyer, optional)
-├── sidecar.py            the desktop app's backend: --serve + a stdin control channel
+├── config.py            # typed settings
+├── logging.py
+├── cli.py               # entrypoint: text / --voice / --wake / --serve / …
 ├── core/
-│   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types (+ TokenUsage)
-│   ├── events.py         EventBus, the event vocabulary, LevelMeter
-│   ├── agent.py          tool-calling loop + confirmation gate
-│   ├── voice_session.py  one push-to-talk turn: transcribe -> agent -> speak
-│   ├── voice_loop.py     hands-free state machine; catches failed turns, announce()
-│   └── scheduler.py      ReminderScheduler: delivers due reminders exactly once
-├── obs/metrics.py        per-turn timers, JSONL recorder, summary() (p50/p95)
-├── server/               the local panel (--serve)
-│   ├── app.py            FastAPI app: /, /health, /metrics, /ws; loopback-only, Host/Origin checks
-│   ├── controller.py     panel commands (text/talk/stop) -> agent and voice loop
-│   └── static/index.html the panel: one self-contained page with the canvas orb
-├── audio/
-│   ├── io.py             mic (Enter-to-stop recording, shared MicStream), playback, chime
-│   └── vad.py            webrtcvad end-of-command detection
-├── wakeword/openwakeword_detector.py  OpenWakeWordDetector
-├── stt/whisper_stt.py    WhisperSTT (faster-whisper)
-├── tts/
-│   ├── factory.py        tts_provider -> TTSEngine
-│   ├── piper_tts.py      PiperTTS
-│   └── system_tts.py     Pyttsx3TTS (OS voice)
-├── llm/
-│   ├── factory.py        llm_provider -> LLMClient
-│   └── gemini_client.py  GeminiClient (the only Gemini-aware module)
-├── memory/
-│   ├── vault.py          Obsidian vault writer + path guard
-│   ├── documents.py      frontmatter parsing + chunking
-│   ├── indexer.py        VaultIndexer (incremental, manifest-based)
-│   ├── embedder.py       LocalEmbedder (fastembed)
-│   ├── vector_store.py   ChromaStore (chromadb)
-│   ├── auto_index.py     AutoIndexingAgent (index after each turn)
-│   └── factory.py        settings -> embedder + store + indexer
-└── tools/                (every module here is scanned by discovery)
-    ├── base.py           Tool ABC, ToolRegistry.discover(), duplicate-name guard
-    ├── context.py        ToolContext: dependencies handed to tools
-    ├── vault_tools.py    WriteTaskNoteTool
-    ├── memory_tools.py   SearchMemoryTool
-    ├── web_tools.py      WebSearchTool (ddgs)
-    ├── time_tools.py     GetDateTimeTool, SetReminderTool, ListRemindersTool
-    ├── file_tools.py     ReadLocalFileTool (sandboxed)
-    ├── _reminders.py     time parsing + reminder store (private helper; not scanned)
-    └── _TODO_connected_tools.md   plan for Gmail/Calendar (not implemented)
-docs/writing-a-tool.md    how to add a tool: one file, with a template
-eval/                     cases.json + run.py: tool-selection regression eval (--fake or live)
-packaging/                PyInstaller spec (+ hook overrides) for the one-file backend
-desktop/                  the Tauri v2 desktop app (see desktop/README.md)
+│   ├── interfaces.py    # LLMClient, STTEngine, TTSEngine, WakeWordDetector, …
+│   ├── agent.py         # async tool-calling loop + confirmation gate
+│   ├── voice_loop.py    # wake→listen→think→speak state machine
+│   └── events.py        # event bus feeding the UI
+├── llm/gemini_client.py # concrete provider (swappable)
+├── stt/ · tts/ · wakeword/ · audio/
+├── memory/              # vault writer, embedder, vector store, indexer
+├── tools/               # auto-discovered Tool plugins
+├── obs/metrics.py       # per-turn latency + token metrics
+└── server/              # FastAPI + static panel
+eval/                    # regression harness (offline + live)
 ```
 
-To add a tool, drop one file in `tools/` (see the guide). To add an LLM
-provider, implement `LLMClient` in `llm/` and add a branch to `llm/factory.py`.
-To add a voice engine, implement `STTEngine` or `TTSEngine` and add a branch to
-`tts/factory.py`. Nothing else needs to change.
+---
 
-## Roadmap
+## License
 
-- **Phase 5.5:** account-connected tools (Gmail, Calendar) behind OAuth, with stricter confirmation. See `tools/_TODO_connected_tools.md`.
-- **Desktop distribution:** code-signing, auto-update (tauri-plugin-updater), macOS/Linux builds.
-- **Later:** cancelling a request mid-flight and per-stage timeouts; approving side-effect tools from the panel instead of the terminal (needed for them to work in the desktop app); barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
+Personal / portfolio project. Note that some bundled voice models (e.g. Piper's
+`alan`) are licensed for personal, non-commercial use — check each model's card
+before any other use.
+
+---
+
+*Built by [Zorrow](https://github.com/Zorrow14) · [portfolio](https://htet-aung-lwin-portfolio.vercel.app)*
