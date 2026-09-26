@@ -3,8 +3,8 @@
   Jarvis panel: one self-contained page (inline CSS + JS, no external requests).
   It is a thin client: everything it shows comes from events on /ws, and it
   sends back only {cmd:"text", text}, {cmd:"talk"} and {cmd:"stop"}.
-  TODO(phase-6+): a Tauri shell or Next.js front end can wrap this page as-is;
-  it only needs same-origin access to /ws.
+  The desktop app (desktop/) wraps this page as-is: its window loads the page
+  from the backend, so it keeps same-origin access to /ws.
 -->
 <html lang="en">
 <head>

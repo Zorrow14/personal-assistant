@@ -223,8 +223,8 @@ def create_app(bus: EventBus, controller: PanelController, *, port: int) -> Fast
     async def events_socket(websocket: WebSocket) -> None:
         await _serve_socket(websocket, bus, controller)
 
-    # TODO(phase-6+): a Tauri shell or Next.js front end can wrap this same page; its
-    # origin (e.g. tauri://localhost) would then need adding to `origin_allowed`.
+    # The desktop app (desktop/) wraps this same page by loading http://127.0.0.1:<port>/
+    # in its window, so the page keeps its own origin and `origin_allowed` needs no exception.
     return app
 
 

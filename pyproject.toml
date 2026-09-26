@@ -41,6 +41,9 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.9",
 ]
+packaging = [
+    "pyinstaller>=6.22.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

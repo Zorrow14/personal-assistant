@@ -1,0 +1,17 @@
+{
+  "name": "jarvis-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Jarvis desktop shell: the local panel in a native window, tray and hotkey.",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "sidecar": "node scripts/build-sidecar.mjs",
+    "sidecar:if-missing": "node scripts/build-sidecar.mjs --if-missing"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

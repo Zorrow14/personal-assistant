@@ -11,6 +11,7 @@ Everything runs through `uv` — deps live in a uv-managed `.venv`, so bare `pyt
 - `uv run pytest -k test_name` — single test
 - `uv run python -m jarvis.cli` — text chat. Flags: `--voice`, `--wake`, `--serve` (local web panel; combines only with `--wake`), `--reindex`, `--health`, `--list-tools`, `--list-devices`, `--metrics`
 - `uv run python eval/run.py --fake` — offline tool-selection eval (scripted LLM, temp vault); drop `--fake` to run it against the real model
+- `cd desktop; npm run dev` / `npm run build` — the Tauri desktop app (dev window / NSIS installer); `npm run sidecar` rebuilds the PyInstaller backend exe it bundles (`packaging/jarvis-backend.spec`). Rust tests: `cargo test --lib` in `desktop/src-tauri`. See `desktop/README.md`
 - `uv run python -m jarvis.cli --list-tools` — the fastest check that a new tool registered (shows a SKIPPED section with the reason when discovery fails)
 - `uv run ruff format .` / `uv run ruff check .` — format and lint (ruff is the only linter here; there is no typechecker and no CI)
 
@@ -53,6 +54,8 @@ Key points that are easy to get wrong:
 - Windows-first project: `webrtcvad-wheels` (not `webrtcvad`) is used to avoid needing MSVC; `pyttsx3` goes through SAPI5. Give PowerShell equivalents in docs alongside POSIX ones.
 - First run downloads models (fastembed ~70 MB on `--reindex`, faster-whisper ~145 MB on `--voice`); tests never do.
 - After a wake-word trigger the detector must be reset **and fed silence** to flush its feature window, or openWakeWord re-fires immediately. Don't "simplify" that away.
+- The desktop app runs a *frozen* copy of the backend: after changing Python code, `npm run sidecar` (in `desktop/`) before `tauri dev`, or the app keeps running the old exe. New lazily-imported modules or package data files may need adding to `packaging/jarvis-backend.spec`.
+- On Windows, never leave a thread blocked reading the stdin pipe: while it waits, `import numpy` in the main thread stalls indefinitely. `sidecar.control_lines` polls the pipe (`PeekNamedPipe`) for this reason; `tests/test_sidecar.py` guards it.
 - Log events are dotted names via structlog (`agent.tool_call`, `tools.discovered`); `Agent` truncates logged values at 200 chars.
 
 ## Repo conventions

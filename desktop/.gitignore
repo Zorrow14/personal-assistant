@@ -1,0 +1,6 @@
+node_modules/
+# Rust build output and generated capability schemas
+src-tauri/target/
+src-tauri/gen/
+# The PyInstaller sidecar is a build artifact (npm run sidecar)
+src-tauri/binaries/

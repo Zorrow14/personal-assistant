@@ -4,9 +4,10 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 6B (metrics, eval, reminders, resilience).** Type a command,
-use push-to-talk, or just say "Hey Jarvis" and speak, in the terminal or in a
-local browser panel with a live voice orb. The LLM (Google Gemini) decides
+**Status: Phase 6.5 (desktop app).** Type a command, use push-to-talk, or just
+say "Hey Jarvis" and speak: in the terminal, in a local browser panel with a
+live voice orb, or in a desktop app (tray icon, global hotkey) that wraps that
+panel. The LLM (Google Gemini) decides
 which tool to call, Jarvis runs it and answers in text or aloud, and each task
 is journaled to the vault. Every turn's latency and token use is recorded
 locally, and a failed turn gets an apology instead of a crash.
@@ -25,8 +26,8 @@ The wake word (openWakeWord), end-of-speech detection (webrtcvad),
 speech-to-text (faster-whisper), text-to-speech (Piper, or the OS voice) and
 the memory index (fastembed + Chroma) all run locally and cost nothing. Not
 built yet, and marked `TODO(phase-N)` in the code: barge-in, cancelling a
-request mid-flight, account-connected tools (Gmail and Calendar) and a packaged
-desktop app.
+request mid-flight, account-connected tools (Gmail and Calendar), approving
+side-effect actions from the panel, and signing/auto-update for the desktop app.
 
 ## Requirements
 
@@ -188,6 +189,27 @@ no login and must never be reachable from another machine:
   open in your browser can't connect to it and give Jarvis commands.
 - The page is one self-contained file with no CDN and no external requests. It is
   served with a strict Content-Security-Policy and can't be framed.
+
+### Desktop app (`desktop/`)
+
+The same panel in a native window (Tauri v2): a tray icon, a global hotkey
+(<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd>) that brings it up from any app, and the
+backend started and stopped for you. Closing the window keeps Jarvis in the tray;
+*Quit* in the tray menu stops everything. It's local-only, like `--serve`.
+
+```powershell
+cd desktop
+npm install
+npm run dev      # develop: the app, with the backend running in this repo
+npm run build    # a Windows installer (NSIS), backend included
+```
+
+The backend is `jarvis --serve` frozen by PyInstaller into one `.exe`
+(`packaging/jarvis-backend.spec`, entrypoint `src/jarvis/sidecar.py`). It still
+reads `.env`, `.jarvis/` and voices from a folder you choose, not from the binary.
+The app has no terminal, so side-effect actions that would ask `y/N` are declined.
+Prerequisites, settings (port, hotkey, wake word, data folder), the icon and
+troubleshooting are in [desktop/README.md](desktop/README.md).
 
 ### Reminders
 
@@ -386,6 +408,7 @@ src/jarvis/
 ├── logging.py            structlog setup + get_logger()
 ├── cli.py                entrypoint: modes, --serve, --metrics, --reindex, --list-tools, wiring
 ├── notifications.py      best-effort desktop toasts (plyer, optional)
+├── sidecar.py            the desktop app's backend: --serve + a stdin control channel
 ├── core/
 │   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types (+ TokenUsage)
 │   ├── events.py         EventBus, the event vocabulary, LevelMeter
@@ -430,6 +453,8 @@ src/jarvis/
     └── _TODO_connected_tools.md   plan for Gmail/Calendar (not implemented)
 docs/writing-a-tool.md    how to add a tool: one file, with a template
 eval/                     cases.json + run.py: tool-selection regression eval (--fake or live)
+packaging/                PyInstaller spec (+ hook overrides) for the one-file backend
+desktop/                  the Tauri v2 desktop app (see desktop/README.md)
 ```
 
 To add a tool, drop one file in `tools/` (see the guide). To add an LLM
@@ -440,4 +465,5 @@ To add a voice engine, implement `STTEngine` or `TTSEngine` and add a branch to
 ## Roadmap
 
 - **Phase 5.5:** account-connected tools (Gmail, Calendar) behind OAuth, with stricter confirmation. See `tools/_TODO_connected_tools.md`.
-- **Later:** cancelling a request mid-flight and per-stage timeouts; a packaged desktop app (Tauri or Next.js) around the same panel page; approving side-effect tools from the panel instead of the terminal; barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
+- **Desktop distribution:** code-signing, auto-update (tauri-plugin-updater), macOS/Linux builds.
+- **Later:** cancelling a request mid-flight and per-stage timeouts; approving side-effect tools from the panel instead of the terminal (needed for them to work in the desktop app); barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.

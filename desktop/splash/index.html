@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<!-- Shown by the desktop shell while the backend starts, restarts or has failed. The shell
+     describes the state in the URL fragment (#state=...&title=...&detail=...&log=...);
+     once /health is ok it navigates this window to the real panel on 127.0.0.1. -->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #05070a;
+    --bg-raised: #0a0e13;
+    --line: #18202a;
+    --text: #cdd6e1;
+    --text-dim: #6f7d8d;
+    --text-faint: #3b4755;
+    --idle: #4cc9f0;
+    --error: #ff5d6c;
+    --accent: var(--idle);
+    --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; display: grid; place-items: center; padding: 24px 16px;
+    background:
+      radial-gradient(ellipse 70% 60% at 50% 40%, rgba(76, 201, 240, 0.05), transparent 70%),
+      radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.035) 1px, transparent 0) 0 0 / 22px 22px,
+      var(--bg);
+    color: var(--text); font: 13px/1.55 var(--mono); -webkit-font-smoothing: antialiased;
+  }
+  body.error { --accent: var(--error); }
+  main { width: min(640px, 100%); display: grid; justify-items: center; gap: 18px; text-align: center; }
+  .orb {
+    width: 96px; height: 96px; border-radius: 50%;
+    background: radial-gradient(circle at 50% 42%, color-mix(in srgb, var(--accent) 55%, white), var(--accent) 45%, transparent 72%);
+    box-shadow: 0 0 60px color-mix(in srgb, var(--accent) 35%, transparent);
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  body.error .orb { animation: none; opacity: 0.8; }
+  @keyframes breathe { 50% { transform: scale(0.86); opacity: 0.65; } }
+  h1 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: 0.32em; text-transform: uppercase; color: var(--accent); }
+  #detail { margin: 0; color: var(--text-dim); max-width: 520px; overflow-wrap: anywhere; }
+  pre {
+    display: none; width: 100%; max-height: 42vh; overflow: auto; margin: 0; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 8px; background: var(--bg-raised);
+    color: var(--text-dim); font: 11px/1.5 var(--mono); text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  body.error pre.filled { display: block; }
+  .hint { margin: 0; color: var(--text-faint); font-size: 11px; }
+  @media (prefers-reduced-motion: reduce) { .orb { animation: none; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="orb" aria-hidden="true"></div>
+  <h1 id="title">Starting Jarvis…</h1>
+  <p id="detail">Loading the assistant. The first start can take a minute.</p>
+  <pre id="log" aria-label="Recent backend log"></pre>
+  <p class="hint" id="hint">Close this window to keep Jarvis in the tray. Ctrl+Alt+J brings it back.</p>
+</main>
+<script src="splash.js"></script>
+</body>
+</html>
