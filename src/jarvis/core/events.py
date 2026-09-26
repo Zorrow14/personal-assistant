@@ -39,7 +39,10 @@ NOTICE = "notice"
 """{message}: informational, e.g. "busy" or how to quit."""
 HELLO = "hello"
 """Sent once to each new panel connection: current state and what the panel can do."""
-# TODO(phase-6b): REMINDER = "reminder", emitted by the scheduler when a reminder is due.
+METRICS = "metrics"
+"""{turn, session}: one finished turn's stage latencies and token counts, plus session totals."""
+REMINDER = "reminder"
+"""{id, text, due, late_seconds, message}: a reminder just came due."""
 
 STATE_IDLE = "idle"
 STATE_LISTENING = "listening"

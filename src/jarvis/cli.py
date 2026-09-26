@@ -9,13 +9,15 @@ python -m jarvis.cli --reindex       build/refresh the memory index, then exit
 python -m jarvis.cli --list-tools    show auto-discovered tools, then exit
 python -m jarvis.cli --health        check config and vault, then exit
 python -m jarvis.cli --list-devices  show audio device indices, then exit
+python -m jarvis.cli --metrics       summarise recorded latency / LLM usage, then exit
 """
 
 import argparse
 import asyncio
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
@@ -41,11 +43,14 @@ from jarvis.logging import configure_logging, get_logger
 from jarvis.memory.auto_index import AutoIndexingAgent
 from jarvis.memory.factory import build_memory
 from jarvis.memory.vault import Vault, VaultError
+from jarvis.obs.metrics import MetricsRecorder, format_summary, summarize_file
 from jarvis.tools.base import DuplicateToolError, ToolRegistry, discover_tool_classes
 from jarvis.tools.context import ToolContext
 
 if TYPE_CHECKING:
+    from jarvis.core.scheduler import ReminderScheduler, SpeakFn
     from jarvis.server.controller import PanelController
+
 
 log = get_logger(__name__)
 
@@ -84,6 +89,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="list audio devices (for JARVIS_INPUT_DEVICE / JARVIS_OUTPUT_DEVICE) and exit",
     )
+    mode.add_argument(
+        "--metrics",
+        action="store_true",
+        help="summarise recorded per-turn latency and LLM requests/tokens, then exit",
+    )
     parser.add_argument(
         "--serve",
         action="store_true",
@@ -98,7 +108,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.serve and any(
-        (args.health, args.voice, args.reindex, args.list_tools, args.list_devices)
+        (args.health, args.voice, args.reindex, args.list_tools, args.list_devices, args.metrics)
     ):
         parser.error("--serve can only be combined with --wake")
     return args
@@ -175,6 +185,49 @@ def build_tool_registry(settings: Settings, context: ToolContext) -> ToolRegistr
         if unknown:
             log.warning("tools.unknown_in_enabled_tools", names=unknown)
     return registry
+
+
+def build_metrics(settings: Settings, *, events: EventBus | None = None) -> MetricsRecorder:
+    """Per-turn metrics for this process, appended to `metrics_path` unless disabled."""
+    return MetricsRecorder(
+        settings.metrics_path,
+        enabled=settings.metrics_enabled,
+        bus=events,
+        model=settings.llm_model,
+    )
+
+
+def build_scheduler(
+    settings: Settings,
+    *,
+    speak: "SpeakFn | None",
+    events: EventBus | None = None,
+    display: Callable[[str], None] | None = None,
+) -> "ReminderScheduler":
+    """The reminder scheduler for --wake / --serve, delivering per `reminder_notify`."""
+    from jarvis.core.scheduler import ReminderScheduler
+    from jarvis.notifications import desktop_notify
+    from jarvis.tools._reminders import ReminderStore
+
+    return ReminderScheduler(
+        ReminderStore(settings.reminders_path),
+        notify=settings.reminder_notify,
+        speak=speak,
+        toast=desktop_notify,
+        bus=events,
+        display=display,
+        poll_seconds=settings.reminder_poll_seconds,
+    )
+
+
+def run_metrics() -> int:
+    """Print a summary of the recorded per-turn metrics. Returns a process exit code."""
+    try:
+        path = get_settings().metrics_path
+    except ValidationError:  # config incomplete: read the default location
+        path = Path(".jarvis/metrics.jsonl")
+    print(format_summary(summarize_file(path)))
+    return 0
 
 
 def run_health() -> int:
@@ -319,7 +372,7 @@ def run_repl() -> int:
     # One event loop for the whole session, so the LLM client's HTTP session is reused.
     with asyncio.Runner() as runner:
         try:
-            _chat(agent, runner)
+            _chat(agent, runner, build_metrics(settings))
         finally:
             runner.run(agent.llm.aclose())
     print("Bye.")
@@ -362,7 +415,7 @@ def run_voice() -> int:
                 f"Jarvis voice ready ({settings.llm_provider} / {settings.llm_model}, "
                 f"tts: {settings.tts_provider})."
             )
-            _voice_chat(session, runner, record)
+            _voice_chat(session, runner, record, build_metrics(settings))
         finally:
             runner.run(agent.llm.aclose())
     print("Bye.")
@@ -423,11 +476,13 @@ def run_wake() -> int:
                     chime=chime if settings.wake_chime else None,
                     wake_phrase=wake_phrase,
                     display=_safe_print,
+                    metrics=build_metrics(settings),
                 )
+                scheduler = build_scheduler(settings, speak=loop.announce, display=_safe_print)
                 print(
                     f"Jarvis is listening. Say '{wake_phrase}', then your command. Ctrl-C to quit."
                 )
-                runner.run(loop.run())
+                runner.run(_with_background(loop.run(), scheduler.run()))
         except KeyboardInterrupt:
             print()
         except VoiceError as exc:
@@ -477,6 +532,7 @@ def _serve_push_to_talk(
     """`--serve`: typing works always; Talk opens the mic for one command at a time."""
     from jarvis.server.controller import PanelController, PushToTalkVoice
 
+    metrics = build_metrics(settings, events=bus)
     voice: PushToTalkVoice | None = None
     voice_error: str | None = None
     try:
@@ -492,14 +548,28 @@ def _serve_push_to_talk(
         def make_loop(detector: WakeWordDetector, source: FrameSource) -> WakeWordLoop:
             # No wake word in this mode, so the loop's "listening for ..." lines stay quiet.
             return WakeWordLoop(
-                agent, stt, tts, detector, recorder, source, chime=chime, display=_quiet, events=bus
+                agent,
+                stt,
+                tts,
+                detector,
+                recorder,
+                source,
+                chime=chime,
+                display=_quiet,
+                events=bus,
+                metrics=metrics,
             )
 
-        voice = PushToTalkVoice(make_loop, mic, bus, warm_up=stt.load)
+        voice = PushToTalkVoice(make_loop, mic, bus, warm_up=stt.load, speak=tts.speak_async)
     except (VoiceError, ValueError, OSError, ImportError) as exc:
         voice_error = str(exc)
         print(f"NOTE  Talk is disabled (typing still works): {exc}", file=sys.stderr)
-    controller = PanelController(agent, bus, voice=voice, voice_error=voice_error)
+    scheduler = build_scheduler(
+        settings, speak=voice.announce if voice else None, events=bus, display=_safe_print
+    )
+    controller = PanelController(
+        agent, bus, voice=voice, voice_error=voice_error, metrics=metrics, scheduler=scheduler
+    )
     hint = "Type a command or press Talk." if voice else "Type a command."
     return _run_panel(settings, bus, controller, runner, hint)
 
@@ -524,6 +594,7 @@ def _serve_hands_free(
         return 1
 
     wake_phrase = _wake_phrase(settings.wake_word_model)
+    metrics = build_metrics(settings, events=bus)
     trigger = ManualWakeTrigger(detector)  # the panel's Talk button fires it too
     with MicStream(
         STREAM_SAMPLE_RATE, settings.input_device, audio_listener=LevelMeter(bus, LEVEL_MIC)
@@ -540,9 +611,11 @@ def _serve_hands_free(
             wake_phrase=wake_phrase,
             display=_safe_print,
             events=bus,
+            metrics=metrics,
         )
         voice = HandsFreeVoice(loop, trigger, bus, wake_phrase=wake_phrase)
-        controller = PanelController(agent, bus, voice=voice)
+        scheduler = build_scheduler(settings, speak=voice.announce, events=bus, display=_safe_print)
+        controller = PanelController(agent, bus, voice=voice, metrics=metrics, scheduler=scheduler)
         return _run_panel(
             settings, bus, controller, runner, f"Say '{wake_phrase}', type, or press Talk."
         )
@@ -626,7 +699,25 @@ def _safe_print(text: str) -> None:
         print(text.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
-def _chat(agent: Agent, runner: asyncio.Runner) -> None:
+async def _measured[T](metrics: MetricsRecorder | None, source: str, work: Awaitable[T]) -> T:
+    """Await `work` as one measured turn (just await it when metrics are off)."""
+    if metrics is None:
+        return await work
+    with metrics.turn(source):
+        return await work
+
+
+async def _with_background[T](main: Awaitable[T], background: Awaitable[None]) -> T:
+    """Await `main` while `background` runs alongside; cancel `background` when `main` ends."""
+    task = asyncio.ensure_future(background)
+    try:
+        return await main
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _chat(agent: Agent, runner: asyncio.Runner, metrics: MetricsRecorder | None = None) -> None:
     while True:
         try:
             line = input("you> ").strip()
@@ -638,7 +729,7 @@ def _chat(agent: Agent, runner: asyncio.Runner) -> None:
         if line.lower() in EXIT_COMMANDS:
             return
         try:
-            reply = runner.run(agent.run(line))
+            reply = runner.run(_measured(metrics, "text", agent.run(line)))
         except KeyboardInterrupt:
             print("\n(interrupted)")
             return
@@ -653,7 +744,10 @@ def _chat(agent: Agent, runner: asyncio.Runner) -> None:
 
 
 def _voice_chat(
-    session: VoiceSession, runner: asyncio.Runner, record: Callable[[], AudioSamples]
+    session: VoiceSession,
+    runner: asyncio.Runner,
+    record: Callable[[], AudioSamples],
+    metrics: MetricsRecorder | None = None,
 ) -> None:
     # Push-to-talk stays manual on purpose; the hands-free loop is `run_wake`.
     while True:
@@ -664,9 +758,10 @@ def _voice_chat(
             return
         try:
             if typed:
-                outcome = runner.run(session.respond(typed))
+                outcome = runner.run(_measured(metrics, "text", session.respond(typed)))
             else:
-                outcome = runner.run(session.run_turn(record()))
+                audio = record()
+                outcome = runner.run(_measured(metrics, "voice", session.run_turn(audio)))
         except KeyboardInterrupt:
             print("\n(interrupted)")
             return
@@ -690,6 +785,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_health()
     if args.list_devices:
         return run_list_devices()
+    if args.metrics:
+        return run_metrics()
     if args.list_tools:
         return run_list_tools()
     if args.reindex:

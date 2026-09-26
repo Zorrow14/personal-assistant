@@ -75,7 +75,10 @@ def test_parse_when_rejects(text: str, message: str) -> None:
 
 def test_get_datetime() -> None:
     text = asyncio.run(GetDateTimeTool(lambda: NOW).run())
-    assert text == "It is Saturday 26 September 2026, 17:45 (UTC+06:30). ISO: 2026-09-26T17:45:00+06:30"
+    assert (
+        text
+        == "It is Saturday 26 September 2026, 17:45 (UTC+06:30). ISO: 2026-09-26T17:45:00+06:30"
+    )
 
 
 def test_set_reminder_requires_confirmation_and_persists(tmp_path: Path) -> None:
@@ -91,7 +94,7 @@ def test_set_reminder_requires_confirmation_and_persists(tmp_path: Path) -> None
     asyncio.run(setter.run(text="stretch", when="in 20 minutes"))
 
     assert "Reminder saved: 'test the gate' for Sun 27 Sep 2026, 10:00 (in 16 h 15 min)" in reply
-    assert "can't alert" in reply
+    assert "announced when due" in reply  # Phase 6B: the scheduler now delivers them
     listing = asyncio.run(lister.run()).splitlines()
     assert listing[0].startswith("2 reminder(s), soonest first")
     assert listing[1] == "1. Sat 26 Sep 2026, 18:05 (in 20 min): stretch"

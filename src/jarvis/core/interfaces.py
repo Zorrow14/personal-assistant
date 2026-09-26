@@ -27,6 +27,16 @@ limit, was blocked by a safety filter, produced a malformed call, or anything el
 class LLMError(Exception):
     """An LLM backend failed (after any retries) or is misconfigured."""
 
+    def __init__(self, message: str = "", *, status_code: int | None = None) -> None:
+        """
+        Args:
+            message: What went wrong.
+            status_code: The provider's HTTP status, if any (429 = rate-limited,
+                5xx = service trouble), so callers can tell transient failures apart.
+        """
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class VoiceError(Exception):
     """A speech-to-text, text-to-speech or audio engine failed or is misconfigured."""
@@ -76,6 +86,16 @@ class ToolSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenUsage:
+    """Tokens one LLM request consumed, as reported by the provider."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thinking_tokens: int = 0
+    """Reasoning tokens some models spend before answering (billed like output)."""
+
+
+@dataclass(frozen=True, slots=True)
 class LLMResponse:
     """The result of a single LLM completion."""
 
@@ -84,6 +104,8 @@ class LLMResponse:
     stop_reason: StopReason = "end_turn"
     raw: object = None
     """The provider's untouched response, for debugging and history replay."""
+    usage: TokenUsage | None = None
+    """Token counts for this request; None if the provider didn't report them."""
 
 
 class LLMClient(ABC):

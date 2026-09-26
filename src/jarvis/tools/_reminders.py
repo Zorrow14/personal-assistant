@@ -19,7 +19,7 @@ import os
 import re
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -28,8 +28,21 @@ _PART_OF_DAY = {"morning": 9, "afternoon": 15, "evening": 19, "night": 20, "toni
 _WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 _MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 _NUMBER_WORDS = {
-    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30,
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "fifteen": 15,
+    "twenty": 20,
+    "thirty": 30,
 }
 _UNIT_MINUTES = {"minute": 1, "min": 1, "hour": 60, "hr": 60, "day": 1440, "week": 10080}
 
@@ -44,7 +57,9 @@ _MONTH_DAY = re.compile(
     r"\b(" + "|".join(_MONTHS) + r")[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b"
 )
 _DAY_MONTH = re.compile(
-    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(" + "|".join(_MONTHS) + r")[a-z]*\.?(?:,?\s+(\d{4}))?\b"
+    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?("
+    + "|".join(_MONTHS)
+    + r")[a-z]*\.?(?:,?\s+(\d{4}))?\b"
 )
 _FILLER = {"on", "at", "the", "this", "next", "coming", "by", "of", "in"}
 
@@ -69,7 +84,11 @@ def parse_when(text: str, now: datetime) -> datetime:
     if not text:
         raise ReminderTimeError(f"No time given. {HELP}")
 
-    result = _parse_iso(original.strip(), now) or _parse_relative(text, now) or _parse_absolute(text, now)
+    result = (
+        _parse_iso(original.strip(), now)
+        or _parse_relative(text, now)
+        or _parse_absolute(text, now)
+    )
     if result is None:
         raise ReminderTimeError(f"Couldn't understand the time {original!r}. {HELP}")
     if result <= now:
@@ -235,10 +254,23 @@ class Reminder:
     text: str
     due: datetime
     created: datetime
+    fired_at: datetime | None = None
+    """When the scheduler delivered it; None while it's still pending."""
 
 
 class ReminderStoreError(Exception):
     """The reminders file exists but can't be read; it is left untouched."""
+
+
+_FILE_LOCKS: dict[Path, threading.Lock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    """One lock per file, shared by every store instance (the tools and the scheduler)."""
+    key = path.resolve()
+    with _FILE_LOCKS_GUARD:
+        return _FILE_LOCKS.setdefault(key, threading.Lock())
 
 
 class ReminderStore:
@@ -246,7 +278,7 @@ class ReminderStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._lock = threading.Lock()
+        self._lock = _lock_for(self.path)
 
     def add(self, text: str, due: datetime, *, now: datetime) -> Reminder:
         """Append a reminder and save."""
@@ -262,6 +294,26 @@ class ReminderStore:
         with self._lock:
             return sorted(self._load(), key=lambda r: r.due)
 
+    def claim_due(self, now: datetime) -> list[Reminder]:
+        """Mark every pending reminder due by `now` as fired, save, and return them.
+
+        Marking happens before anyone delivers them, so a reminder is announced
+        at most once, even if Jarvis crashes halfway through announcing it.
+        """
+        with self._lock:
+            reminders = self._load()
+            due_ids = {r.id for r in reminders if r.fired_at is None and _aware(r.due, now) <= now}
+            if not due_ids:
+                return []
+            updated = [replace(r, fired_at=now) if r.id in due_ids else r for r in reminders]
+            self._save(updated)
+        return sorted((r for r in updated if r.id in due_ids), key=lambda r: r.due)
+
+    def next_pending(self, now: datetime) -> datetime | None:
+        """When the next not-yet-fired reminder is due (None if there are none)."""
+        pending = [_aware(r.due, now) for r in self.all() if r.fired_at is None]
+        return min(pending) if pending else None
+
     def _load(self) -> list[Reminder]:
         if not self.path.exists():
             return []
@@ -273,6 +325,7 @@ class ReminderStore:
                     text=str(item["text"]),
                     due=datetime.fromisoformat(item["due"]),
                     created=datetime.fromisoformat(item["created"]),
+                    fired_at=datetime.fromisoformat(item["fired"]) if item.get("fired") else None,
                 )
                 for item in data["reminders"]
             ]
@@ -286,10 +339,21 @@ class ReminderStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "reminders": [
-                {"id": r.id, "text": r.text, "due": r.due.isoformat(), "created": r.created.isoformat()}
+                {
+                    "id": r.id,
+                    "text": r.text,
+                    "due": r.due.isoformat(),
+                    "created": r.created.isoformat(),
+                }
+                | ({"fired": r.fired_at.isoformat()} if r.fired_at else {})
                 for r in reminders
             ]
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.path)
+
+
+def _aware(moment: datetime, now: datetime) -> datetime:
+    """Treat a hand-edited timestamp without a timezone as local time."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=now.tzinfo)

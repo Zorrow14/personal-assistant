@@ -9,7 +9,8 @@ Everything runs through `uv` — deps live in a uv-managed `.venv`, so bare `pyt
 - `uv sync` — install deps (Python >=3.12, pinned 3.12 via `.python-version`)
 - `uv run pytest` — full suite; fully offline (fakes for LLM/STT/TTS/wake/VAD/memory, temp vault, no mic)
 - `uv run pytest -k test_name` — single test
-- `uv run python -m jarvis.cli` — text chat. Flags: `--voice`, `--wake`, `--serve` (local web panel; combines only with `--wake`), `--reindex`, `--health`, `--list-tools`, `--list-devices`
+- `uv run python -m jarvis.cli` — text chat. Flags: `--voice`, `--wake`, `--serve` (local web panel; combines only with `--wake`), `--reindex`, `--health`, `--list-tools`, `--list-devices`, `--metrics`
+- `uv run python eval/run.py --fake` — offline tool-selection eval (scripted LLM, temp vault); drop `--fake` to run it against the real model
 - `uv run python -m jarvis.cli --list-tools` — the fastest check that a new tool registered (shows a SKIPPED section with the reason when discovery fails)
 - `uv run ruff format .` / `uv run ruff check .` — format and lint (ruff is the only linter here; there is no typechecker and no CI)
 

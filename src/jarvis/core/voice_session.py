@@ -10,6 +10,7 @@ from enum import Enum
 
 from jarvis.core.agent import Agent
 from jarvis.core.interfaces import AudioSamples, STTEngine, TTSEngine
+from jarvis.obs import metrics
 
 EXIT_COMMANDS = frozenset({"exit", "quit"})
 NOT_HEARD_MESSAGE = "(Didn't catch that. Press Enter and try again.)"
@@ -60,9 +61,11 @@ class VoiceSession:
 
     async def run_turn(self, audio: AudioSamples) -> TurnOutcome:
         """Transcribe `audio`, show it, then `respond`. Empty speech skips the agent."""
-        transcript = (await self.stt.transcribe_async(audio)).strip()
+        with metrics.timer(metrics.STAGE_STT):
+            transcript = (await self.stt.transcribe_async(audio)).strip()
         if not transcript:
             self._display(NOT_HEARD_MESSAGE)
+            metrics.set_outcome(metrics.OUTCOME_EMPTY)
             return TurnOutcome.EMPTY
         self._display(f"you> {transcript}")
         return await self.respond(transcript)
@@ -70,8 +73,10 @@ class VoiceSession:
     async def respond(self, text: str) -> TurnOutcome:
         """Run `text` through the agent, show the reply, and speak it."""
         if is_exit_command(text):
+            metrics.set_outcome(metrics.OUTCOME_EXIT)
             return TurnOutcome.EXIT
         reply = await self.agent.run(text)
         self._display(f"jarvis> {reply}")
-        await self.tts.speak_async(speakable(reply))
+        with metrics.timer(metrics.STAGE_TTS):
+            await self.tts.speak_async(speakable(reply))
         return TurnOutcome.REPLIED

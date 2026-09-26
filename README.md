@@ -4,17 +4,18 @@ A voice-driven personal assistant that interprets natural-language commands, act
 on them through LLM tool-calling, speaks its replies, and journals every task into
 an Obsidian vault as plain Markdown.
 
-**Status: Phase 6A (local panel).** Type a command, use push-to-talk, or
-just say "Hey Jarvis" and speak, in the terminal or in a local browser panel
-with a live voice orb. The LLM (Google Gemini) decides which tool to call,
-Jarvis runs it and answers in text or aloud, and each task is journaled to the
-vault.
+**Status: Phase 6B (metrics, eval, reminders, resilience).** Type a command,
+use push-to-talk, or just say "Hey Jarvis" and speak, in the terminal or in a
+local browser panel with a live voice orb. The LLM (Google Gemini) decides
+which tool to call, Jarvis runs it and answers in text or aloud, and each task
+is journaled to the vault. Every turn's latency and token use is recorded
+locally, and a failed turn gets an apology instead of a crash.
 
 Jarvis can also:
 - search its own history and cite past notes as `[[note_name]]`
 - search the web
 - tell the date and time
-- save and list reminders (it asks you first before saving)
+- save reminders (it asks you first) and announce them when they're due
 - read text files, but only from inside your vault
 
 Tools are plugins: a new capability is one new file in `src/jarvis/tools/`. See
@@ -23,8 +24,9 @@ Tools are plugins: a new capability is one new file in `src/jarvis/tools/`. See
 The wake word (openWakeWord), end-of-speech detection (webrtcvad),
 speech-to-text (faster-whisper), text-to-speech (Piper, or the OS voice) and
 the memory index (fastembed + Chroma) all run locally and cost nothing. Not
-built yet, and marked `TODO(phase-N)` in the code: barge-in, reminder alerts,
-metrics, account-connected tools (Gmail and Calendar) and a packaged desktop app.
+built yet, and marked `TODO(phase-N)` in the code: barge-in, cancelling a
+request mid-flight, account-connected tools (Gmail and Calendar) and a packaged
+desktop app.
 
 ## Requirements
 
@@ -84,6 +86,10 @@ directory you run Jarvis from.
 | `JARVIS_FILE_SANDBOX_ROOT` | no | vault folder | The only folder `read_local_file` may read under. |
 | `JARVIS_UI_HOST` | no | `127.0.0.1` | Where `--serve` listens. **Loopback only** (`127.0.0.1`, `::1`, `localhost`). Anything else, including `0.0.0.0`, is rejected at startup. |
 | `JARVIS_UI_PORT` | no | `8000` | Port for `--serve`. |
+| `JARVIS_METRICS_PATH` | no | `.jarvis/metrics.jsonl` | Where per-turn metrics go: one JSON line per turn with stage latencies, LLM requests and tokens. Local only. |
+| `JARVIS_METRICS_ENABLED` | no | `true` | Set to `false` to stop writing metrics. The panel's metrics strip still works. |
+| `JARVIS_REMINDER_POLL_SECONDS` | no | `30` | How often the scheduler checks for due reminders (in `--wake` and `--serve`). |
+| `JARVIS_REMINDER_NOTIFY` | no | `tts` | How a due reminder is delivered: `tts` (spoken), `toast` (desktop notification) or `both`. The panel always shows it. |
 
 `.env` is git-ignored. Never commit real keys.
 
@@ -114,6 +120,9 @@ uv run python -m jarvis.cli --reindex       # build/refresh the memory index ove
 uv run python -m jarvis.cli --list-tools    # auto-discovered tools and their confirmation flags
 uv run python -m jarvis.cli --health        # check config + vault, then exit
 uv run python -m jarvis.cli --list-devices  # audio device indices
+uv run python -m jarvis.cli --metrics       # latency percentiles per stage, LLM requests and tokens
+uv run python eval/run.py --fake            # tool-selection eval, scripted and offline (for CI)
+uv run python eval/run.py                   # the same eval against your configured LLM
 uv run pytest                               # offline: fakes for LLM/STT/TTS/wake/VAD/memory, temp vault, no mic
 ```
 
@@ -179,6 +188,56 @@ no login and must never be reachable from another machine:
   open in your browser can't connect to it and give Jarvis commands.
 - The page is one self-contained file with no CDN and no external requests. It is
   served with a strict Content-Security-Policy and can't be framed.
+
+### Reminders
+
+Ask for one ("remind me to stretch in 10 minutes") and confirm the `y/N` prompt.
+While Jarvis is running with `--wake` or `--serve`, a scheduler checks
+`.jarvis/reminders.json` every 30 seconds. When a reminder is due, Jarvis:
+
+- shows it in the panel and prints it in the terminal;
+- says "Reminder: stretch" aloud, waiting for any conversation in progress to
+  finish, and not listening for the wake word while it speaks;
+- optionally shows a desktop notification (`JARVIS_REMINDER_NOTIFY=toast` or `both`).
+
+A reminder is marked delivered in the file before it's announced, so it's never
+repeated, not even after a crash or restart. Reminders that came due while
+Jarvis wasn't running are delivered at startup, saying when they were due.
+Text chat and `--voice` don't run the scheduler.
+
+### Metrics and evaluation
+
+Every turn, in every mode, appends one line to `.jarvis/metrics.jsonl`:
+
+- **Timings:** `wake_to_stt` (the chime plus you speaking), `stt`, `llm_total`
+  (all LLM requests, summed), `tool_total`, `tts` and `total`.
+- **Usage:** LLM requests and input/output tokens, as Gemini reports them.
+- **Also recorded:** tool calls and errors, the outcome, and the model name.
+
+`--metrics` and `GET /metrics` summarise the file: p50/p95 per stage, totals,
+and which stage dominates Jarvis's own time. The panel shows the last turn's
+timings and the session totals under the orb. Nothing leaves your machine.
+
+`eval/run.py` is a small regression check for tool selection, useful when
+switching models. Each case in `eval/cases.json` gives an input and the tool it
+should trigger, for example "what time is it" should call `get_datetime`, and
+optionally text the reply must contain. Cases run through the real agent and
+tools on a throwaway vault in a temp folder, never your own; web search is
+canned with `--fake`. `--fake` uses a scripted LLM, needs no network or key,
+and fits CI. Without it, the eval runs against the model in your `.env` and
+prints a pass/fail table and score. It exits 1 below `--min-score`, which
+defaults to 1.0.
+
+### When something fails
+
+A turn that fails after the wake word never takes Jarvis down. This covers
+recording, STT, the LLM, a tool and TTS. The error appears in the panel and the
+log, Jarvis says "Sorry, something went wrong.", and it goes back to listening.
+If the free tier's rate limit wins after the retries, it says it's being
+rate-limited instead. A tool that raises is reported back to the model as an
+error, so the model can explain or retry. If the `y/N` prompt itself fails, the
+action is declined, never run. Only a persistent fault, 3 failures in a row
+such as an unplugged mic, stops the loop.
 
 `--health` loads the settings, creates `<vault>/Jarvis/` if it is missing, checks
 that the folder is writable, and prints `OK` with the resolved vault path and the
@@ -270,7 +329,7 @@ Run `--reindex` once to index your existing notes. After that:
 | `search_memory` | memory | no | Semantic search over past notes. |
 | `web_search` | web | no | Searches DuckDuckGo via `ddgs`, with no API key. Returns titles, snippets and URLs. |
 | `get_datetime` | time | no | The current local date, time and timezone. |
-| `set_reminder` | time | **yes** | Saves a reminder, parsing times like "tomorrow at 9am" or "in 2 hours". It doesn't alert you yet. |
+| `set_reminder` | time | **yes** | Saves a reminder, parsing times like "tomorrow at 9am" or "in 2 hours". Announced when due in `--wake` / `--serve` (see [Reminders](#reminders)). |
 | `list_reminders` | time | no | Lists saved reminders and flags overdue ones. |
 | `read_local_file` | files | no | Reads a text file **only from inside the sandbox**, which is the vault by default. The path is resolved first (following `..`, symlinks and junctions), and anything that lands outside is refused. |
 
@@ -325,15 +384,18 @@ so nothing is overwritten.
 src/jarvis/
 ├── config.py             Settings (pydantic-settings)
 ├── logging.py            structlog setup + get_logger()
-├── cli.py                entrypoint: modes, --serve, --reindex, --list-tools, --health, wiring
+├── cli.py                entrypoint: modes, --serve, --metrics, --reindex, --list-tools, wiring
+├── notifications.py      best-effort desktop toasts (plyer, optional)
 ├── core/
-│   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types
+│   ├── interfaces.py     LLMClient / STTEngine / TTSEngine ABCs + neutral types (+ TokenUsage)
 │   ├── events.py         EventBus, the event vocabulary, LevelMeter
 │   ├── agent.py          tool-calling loop + confirmation gate
 │   ├── voice_session.py  one push-to-talk turn: transcribe -> agent -> speak
-│   └── voice_loop.py     hands-free state machine (IDLE/LISTENING/PROCESSING/SPEAKING)
+│   ├── voice_loop.py     hands-free state machine; catches failed turns, announce()
+│   └── scheduler.py      ReminderScheduler: delivers due reminders exactly once
+├── obs/metrics.py        per-turn timers, JSONL recorder, summary() (p50/p95)
 ├── server/               the local panel (--serve)
-│   ├── app.py            FastAPI app: /, /health, /ws; loopback-only bind, Host/Origin checks
+│   ├── app.py            FastAPI app: /, /health, /metrics, /ws; loopback-only, Host/Origin checks
 │   ├── controller.py     panel commands (text/talk/stop) -> agent and voice loop
 │   └── static/index.html the panel: one self-contained page with the canvas orb
 ├── audio/
@@ -367,6 +429,7 @@ src/jarvis/
     ├── _reminders.py     time parsing + reminder store (private helper; not scanned)
     └── _TODO_connected_tools.md   plan for Gmail/Calendar (not implemented)
 docs/writing-a-tool.md    how to add a tool: one file, with a template
+eval/                     cases.json + run.py: tool-selection regression eval (--fake or live)
 ```
 
 To add a tool, drop one file in `tools/` (see the guide). To add an LLM
@@ -377,5 +440,4 @@ To add a voice engine, implement `STTEngine` or `TTSEngine` and add a branch to
 ## Roadmap
 
 - **Phase 5.5:** account-connected tools (Gmail, Calendar) behind OAuth, with stricter confirmation. See `tools/_TODO_connected_tools.md`.
-- **Phase 6B:** a scheduler that actually alerts you when reminders are due (a `reminder` event for the panel), metrics on `/health`, and error hardening (timeouts, cancelling a request).
-- **Later:** a packaged desktop app (Tauri or Next.js) around the same panel page; approving side-effect tools from the panel instead of the terminal; barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.
+- **Later:** cancelling a request mid-flight and per-stage timeouts; a packaged desktop app (Tauri or Next.js) around the same panel page; approving side-effect tools from the panel instead of the terminal; barge-in (interrupting Jarvis mid-reply with the wake word); spoken confirmation in voice modes; an opt-in cloud embedder; pgvector behind the `VectorStore` interface; date filters in `search_memory`; trimming long conversation histories.

@@ -21,6 +21,7 @@ from jarvis.core.events import (
 )
 from jarvis.core.interfaces import LLMClient, LLMResponse, Message, ToolCall
 from jarvis.logging import get_logger
+from jarvis.obs import metrics
 from jarvis.tools.base import ToolRegistry
 
 DECLINED_RESULT = "User declined this action."
@@ -119,7 +120,9 @@ class Agent:
         # TODO(phase-4): trim/summarise long histories before they hit the context limit.
         tools = self.registry.schemas() or None
         for _ in range(self.max_iterations):
-            response = await self.llm.complete(tuple(self.history), tools=tools)
+            with metrics.llm_call() as measured:
+                response = await self.llm.complete(tuple(self.history), tools=tools)
+                measured.usage = response.usage
             self.history.append(
                 Message(
                     role="assistant",
@@ -156,22 +159,27 @@ class Agent:
                 True,
             )
             status = TOOL_ERROR
-        elif tool.requires_confirmation and not self._confirm(call):
+        elif tool.requires_confirmation and not self._confirm_or_decline(call):
             result, is_error = DECLINED_RESULT, False
             status = TOOL_DECLINED
         else:
             self._publish_tool(call, category, TOOL_STARTED)
-            try:
-                result, is_error = await tool.run(**tool.parse_args(call.input)), False
-            except ValidationError as exc:
-                problems = "; ".join(
-                    f"{'.'.join(map(str, err['loc'])) or 'input'}: {err['msg']}"
-                    for err in exc.errors()
-                )
-                result, is_error = f"Error: invalid arguments for {call.name}: {problems}", True
-            except Exception as exc:
-                log.exception("agent.tool_failed", tool=call.name)
-                result, is_error = f"Error: {call.name} failed: {type(exc).__name__}: {exc}", True
+            with metrics.tool_call() as measured:
+                try:
+                    result, is_error = await tool.run(**tool.parse_args(call.input)), False
+                except ValidationError as exc:
+                    problems = "; ".join(
+                        f"{'.'.join(map(str, err['loc'])) or 'input'}: {err['msg']}"
+                        for err in exc.errors()
+                    )
+                    result, is_error = f"Error: invalid arguments for {call.name}: {problems}", True
+                except Exception as exc:
+                    log.exception("agent.tool_failed", tool=call.name)
+                    result, is_error = (
+                        f"Error: {call.name} failed: {type(exc).__name__}: {exc}",
+                        True,
+                    )
+                measured.error = is_error
             status = TOOL_ERROR if is_error else TOOL_COMPLETED
         log.info("agent.tool_result", tool=call.name, is_error=is_error, result=_preview(result))
         self._publish_tool(call, category, status, result)
@@ -193,6 +201,14 @@ class Agent:
         if result is not None:
             data["result"] = _preview(result)
         self.events.emit(TOOL, **data)
+
+    def _confirm_or_decline(self, call: ToolCall) -> bool:
+        """`_confirm`, failing closed: if asking breaks, the action doesn't run."""
+        try:
+            return self._confirm(call)
+        except Exception:
+            log.exception("agent.confirm_failed", tool=call.name)
+            return False
 
     def _confirm(self, call: ToolCall) -> bool:
         """Safety gate for risky tools: ask the user before running `call`."""

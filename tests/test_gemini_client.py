@@ -10,7 +10,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from jarvis.config import Settings
-from jarvis.core.interfaces import LLMError, Message, ToolCall, ToolSpec
+from jarvis.core.interfaces import LLMError, Message, TokenUsage, ToolCall, ToolSpec
 from jarvis.llm.gemini_client import (
     GeminiClient,
     from_gemini_response,
@@ -77,7 +77,12 @@ def test_messages_map_to_gemini_roles_and_parts() -> None:
                 content="On it.",
                 tool_calls=[ToolCall(id="jarvis-call-abc", name="write_task_note", input={"a": 1})],
             ),
-            Message(role="tool", content="Saved", tool_call_id="jarvis-call-abc", tool_name="write_task_note"),
+            Message(
+                role="tool",
+                content="Saved",
+                tool_call_id="jarvis-call-abc",
+                tool_name="write_task_note",
+            ),
         ]
     )
 
@@ -96,7 +101,9 @@ def test_parallel_tool_results_merge_into_one_turn_and_errors_are_flagged() -> N
     contents = to_gemini_contents(
         [
             Message(role="tool", content="ok", tool_call_id="real-1", tool_name="a"),
-            Message(role="tool", content="boom", tool_call_id="real-2", tool_name="b", is_error=True),
+            Message(
+                role="tool", content="boom", tool_call_id="real-2", tool_name="b", is_error=True
+            ),
         ]
     )
 
@@ -109,9 +116,7 @@ def test_parallel_tool_results_merge_into_one_turn_and_errors_are_flagged() -> N
 
 
 def test_assistant_turn_replays_raw_content_with_thought_signature() -> None:
-    raw = _response(
-        [{"functionCall": {"name": "f", "args": {}}, "thoughtSignature": "c2ln"}]
-    )
+    raw = _response([{"functionCall": {"name": "f", "args": {}}, "thoughtSignature": "c2ln"}])
     contents = to_gemini_contents(
         [Message(role="assistant", tool_calls=[ToolCall("x", "f", {})], raw=raw)]
     )
@@ -170,7 +175,9 @@ def test_finish_reasons_map_to_neutral_stop_reasons(finish: str, expected: str) 
 
 
 def test_blocked_prompt_has_no_candidates() -> None:
-    raw = types.GenerateContentResponse.model_validate({"promptFeedback": {"blockReason": "SAFETY"}})
+    raw = types.GenerateContentResponse.model_validate(
+        {"promptFeedback": {"blockReason": "SAFETY"}}
+    )
     result = from_gemini_response(raw)
     assert (result.text, result.tool_calls, result.stop_reason) == (None, [], "safety")
 
@@ -208,6 +215,44 @@ def test_non_retryable_error_fails_immediately() -> None:
 
     assert len(models.calls) == 1
     assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("code", "status"), [(429, "RESOURCE_EXHAUSTED"), (400, "INVALID_ARGUMENT")]
+)
+def test_errors_carry_the_http_status(code: int, status: str) -> None:
+    client, _models, _sleeps = _client(errors=[_api_error(code, status)] * 5)
+
+    with pytest.raises(LLMError) as raised:
+        asyncio.run(client.complete([Message(role="user", content="hi")]))
+
+    assert raised.value.status_code == code  # lets the voice loop pick the right apology
+
+
+def test_token_usage_is_returned_with_the_response() -> None:
+    response = types.GenerateContentResponse.model_validate(
+        {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "hi"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {
+                "promptTokenCount": 120,
+                "candidatesTokenCount": 8,
+                "thoughtsTokenCount": 3,
+                "totalTokenCount": 131,
+            },
+        }
+    )
+    client, _models, _sleeps = _client(response)
+
+    result = asyncio.run(client.complete([Message(role="user", content="hi")]))
+
+    assert result.usage == TokenUsage(input_tokens=120, output_tokens=8, thinking_tokens=3)
+    assert result.text == "hi"  # the translation itself is unchanged
+
+
+def test_missing_usage_metadata_means_no_usage() -> None:
+    assert from_gemini_response(_response([{"text": "hi"}])).usage is None
 
 
 def test_from_settings_requires_api_key(tmp_path: Path) -> None:

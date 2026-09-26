@@ -109,7 +109,9 @@ def test_full_cycle_wake_record_transcribe_agent_speak(vault: Vault) -> None:
     assert h.loop.state is LoopState.IDLE
     assert "you> Log that I finished the wake-word module." in h.shown
     assert "jarvis> Logged it." in h.shown
-    assert (vault.jarvis_root / "Tasks" / "2026-09-26-1200-finish-the-wake-word-module.md").is_file()
+    assert (
+        vault.jarvis_root / "Tasks" / "2026-09-26-1200-finish-the-wake-word-module.md"
+    ).is_file()
 
 
 def test_detector_reset_after_trigger() -> None:
@@ -187,7 +189,8 @@ def test_llm_error_is_reported_and_loop_continues() -> None:
     asyncio.run(h.loop.run())
 
     assert any("[LLM error] 429" in line for line in h.shown)
-    assert h.tts.spoken == []
+    # Phase 6B: a failed turn is apologised for aloud instead of going silent.
+    assert h.tts.spoken == ["Sorry, something went wrong."]
 
 
 def test_stop_ends_wait_for_wake_word() -> None:
@@ -204,7 +207,9 @@ def test_stop_ends_wait_for_wake_word() -> None:
     h = Harness(scores=[0.0] * 10, transcripts=[], responses=[])
     ref: list[WakeWordLoop] = []
     source = StoppingSource(ref)
-    h.loop = WakeWordLoop(h.loop.agent, h.stt, h.tts, h.detector, h.vad, source, display=h.shown.append)
+    h.loop = WakeWordLoop(
+        h.loop.agent, h.stt, h.tts, h.detector, h.vad, source, display=h.shown.append
+    )
     ref.append(h.loop)
 
     asyncio.run(h.loop.run())

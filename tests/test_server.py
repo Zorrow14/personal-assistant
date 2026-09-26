@@ -4,6 +4,7 @@ import asyncio
 import socket
 import time
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -28,11 +29,13 @@ from jarvis.core.interfaces import (
     FrameSource,
     LLMResponse,
     Message,
+    TokenUsage,
     ToolCall,
     ToolSpec,
     WakeWordDetector,
 )
 from jarvis.core.voice_loop import WakeWordLoop
+from jarvis.obs.metrics import MetricsRecorder
 from jarvis.server import app as app_module
 from jarvis.server.app import (
     INDEX_HTML,
@@ -214,6 +217,38 @@ def test_health_returns_ok() -> None:
         response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_metrics_endpoint_summarises_recorded_turns(tmp_path: Path) -> None:
+    bus = EventBus()
+    recorder = MetricsRecorder(tmp_path / "metrics.jsonl", bus=bus, model="gemini-test")
+    agent = _agent(
+        bus, [LLMResponse(text="Hi.", usage=TokenUsage(input_tokens=50, output_tokens=3))]
+    )
+    controller = PanelController(agent, bus, metrics=recorder)
+    with (
+        _client(bus, controller) as client,
+        client.websocket_connect(WS_URL, headers=PANEL_ORIGIN) as ws,
+    ):
+        ws.receive_json()  # hello
+        ws.send_json({"cmd": "text", "text": "hello"})
+        metrics_event = _receive_until(ws, lambda e: e["type"] == "metrics")[-1]
+        summary = client.get("/metrics").json()
+
+    assert metrics_event["data"]["turn"]["source"] == "panel"
+    assert metrics_event["data"]["session"]["input_tokens"] == 50
+    assert summary["enabled"] is True
+    assert summary["turns"] == 1
+    assert summary["llm_requests"] == 1
+    assert (summary["input_tokens"], summary["output_tokens"]) == (50, 3)
+    assert "llm_total" in summary["stages_ms"]
+    assert summary["session"]["turns"] == 1
+
+
+def test_metrics_endpoint_without_a_recorder() -> None:
+    bus = EventBus()
+    with _client(bus, PanelController(_agent(bus, []), bus)) as client:
+        assert client.get("/metrics").json() == {"enabled": False, "turns": 0}
 
 
 def test_index_serves_the_panel_with_locked_down_headers() -> None:

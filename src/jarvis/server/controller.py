@@ -9,7 +9,8 @@ come from the same code in every mode.
 
 import asyncio
 import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Protocol
 
 from jarvis import __version__
@@ -21,15 +22,18 @@ from jarvis.core.events import (
     STATE,
     STATE_IDLE,
     STATE_LISTENING,
+    STATE_SPEAKING,
     STATE_THINKING,
     TRANSCRIPT,
     Event,
     EventBus,
 )
 from jarvis.core.interfaces import AudioSamples, FrameSource, LLMError, WakeWordDetector
+from jarvis.core.scheduler import ReminderScheduler
 from jarvis.core.voice_loop import LoopState, TurnResult, WakeWordLoop, event_state
-from jarvis.core.voice_session import is_exit_command
+from jarvis.core.voice_session import is_exit_command, speakable
 from jarvis.logging import get_logger
+from jarvis.obs.metrics import MetricsRecorder
 
 MAX_TEXT_CHARS = 4000
 """Longest typed command the panel accepts."""
@@ -139,6 +143,10 @@ class HandsFreeVoice:
         """Start listening for the wake word in the background."""
         self._task = asyncio.create_task(self._keep_listening(), name="jarvis-hands-free")
 
+    async def announce(self, text: str) -> None:
+        """Say `text` between turns (e.g. a due reminder), without hearing itself."""
+        await self.loop.announce(text)
+
     def trigger(self) -> Event | None:
         """Start a voice turn now. Returns a message for the requester if it can't."""
         if self.state is None:
@@ -195,6 +203,7 @@ class PushToTalkVoice:
         bus: EventBus,
         *,
         warm_up: Callable[[], None] | None = None,
+        speak: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         """
         Args:
@@ -203,13 +212,16 @@ class PushToTalkVoice:
             bus: Where notices go.
             warm_up: Blocking preparation to run in the background at start
                 (loading the Whisper model), so the first Talk is quick.
+            speak: The TTS used for `announce` (e.g. due reminders).
         """
         self._make_loop = make_loop
         self._mic = mic
         self._bus = bus
         self._warm_up = warm_up
+        self._speak = speak
         self._warm_task: asyncio.Task[None] | None = None
         self._loop: WakeWordLoop | None = None
+        self._speech_lock = asyncio.Lock()  # a Talk turn and an announcement never overlap
 
     @property
     def state(self) -> str | None:
@@ -223,18 +235,33 @@ class PushToTalkVoice:
 
     async def talk_turn(self) -> None:
         """Open the mic and run one listen -> transcribe -> answer -> speak cycle."""
-        trigger = ManualWakeTrigger()
-        trigger.trigger()  # fires on the first frame: go straight to listening
-        loop = self._make_loop(trigger, self._mic)
-        self._loop = loop
-        try:
-            await asyncio.to_thread(self._mic.start)
-            result = await loop.run_once()
-        finally:
-            self._loop = None
-            await asyncio.to_thread(self._mic.close)
+        async with self._speech_lock:
+            trigger = ManualWakeTrigger()
+            trigger.trigger()  # fires on the first frame: go straight to listening
+            loop = self._make_loop(trigger, self._mic)
+            self._loop = loop
+            try:
+                await asyncio.to_thread(self._mic.start)
+                result = await loop.run_once()
+            finally:
+                self._loop = None
+                await asyncio.to_thread(self._mic.close)
         if result is TurnResult.EXIT:
             self._bus.emit(NOTICE, message=EXIT_HINT)
+
+    async def announce(self, text: str) -> None:
+        """Say `text` (e.g. a due reminder) once no Talk turn is running.
+
+        The mic is closed between Talk turns, so there's nothing to mute.
+        """
+        if self._speak is None:
+            return
+        async with self._speech_lock:
+            self._bus.emit(STATE, state=STATE_SPEAKING)
+            try:
+                await self._speak(speakable(text))
+            finally:
+                self._bus.emit(STATE, state=STATE_IDLE)
 
     def stop(self) -> bool:
         """Abandon the recording in progress, if any. Returns whether anything was stopped."""
@@ -277,6 +304,8 @@ class PanelController:
         *,
         voice: PanelVoice | None = None,
         voice_error: str | None = None,
+        metrics: MetricsRecorder | None = None,
+        scheduler: ReminderScheduler | None = None,
     ) -> None:
         """
         Args:
@@ -284,11 +313,16 @@ class PanelController:
             bus: Where this controller's events go.
             voice: Enables Talk; None for a text-only panel.
             voice_error: Why voice is unavailable, shown when Talk is pressed.
+            metrics: Records typed turns (voice turns are recorded by the loop).
+            scheduler: Delivers due reminders while the panel runs.
         """
         self.agent = agent
+        self.metrics = metrics
         self._bus = bus
         self._voice = voice
         self._voice_error = voice_error
+        self._scheduler = scheduler
+        self._scheduler_task: asyncio.Task[None] | None = None
         self._turn: asyncio.Task[None] | None = None
 
     @property
@@ -319,15 +353,20 @@ class PanelController:
         }
 
     async def start(self) -> None:
-        """Start background voice work (the hands-free loop, or model warm-up)."""
+        """Start background work: the voice loop (or model warm-up) and the reminder scheduler."""
         if self._voice is not None:
             await self._voice.start()
+        if self._scheduler is not None:
+            self._scheduler_task = asyncio.create_task(
+                self._scheduler.run(), name="jarvis-reminders"
+            )
 
     async def aclose(self) -> None:
-        """Cancel whatever is running and stop the voice loop."""
-        if self._turn is not None:
-            self._turn.cancel()
-            await asyncio.gather(self._turn, return_exceptions=True)
+        """Cancel whatever is running and stop the voice loop and scheduler."""
+        tasks = [t for t in (self._turn, self._scheduler_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self._voice is not None:
             await self._voice.aclose()
 
@@ -403,8 +442,12 @@ class PanelController:
         """A typed command: exactly what text mode does, observed through events."""
         self._bus.emit(TRANSCRIPT, text=text, source="text")
         self._bus.emit(STATE, state=STATE_THINKING)
-        reply = await self.agent.run(text)
+        with self._measured_turn():
+            reply = await self.agent.run(text)
         self._bus.emit(REPLY, text=reply)
+
+    def _measured_turn(self) -> AbstractContextManager[object]:
+        return self.metrics.turn("panel") if self.metrics is not None else nullcontext()
 
 
 def _error(message: str) -> Event:

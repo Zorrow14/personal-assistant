@@ -207,8 +207,17 @@ def create_app(bus: EventBus, controller: PanelController, *, port: int) -> Fast
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        # TODO(phase-6b): uptime, turn/tool counts, latency and error metrics.
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics_summary() -> dict[str, Any]:
+        """Latency percentiles per stage, LLM requests and tokens (from the local JSONL)."""
+        recorder = controller.metrics
+        if recorder is None:
+            return {"enabled": False, "turns": 0}
+        summary = await asyncio.to_thread(recorder.summary)
+        summary["enabled"] = recorder.enabled
+        return summary
 
     @app.websocket("/ws")
     async def events_socket(websocket: WebSocket) -> None:

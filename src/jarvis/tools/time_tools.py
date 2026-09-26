@@ -1,8 +1,8 @@
 """Date/time and reminder tools.
 
 `set_reminder` has a side effect (it writes to disk), so it requires
-confirmation. Reminders are only recorded and listed for now: nothing alerts
-the user when one is due yet.
+confirmation. Due reminders are announced by `core/scheduler.py`, which runs
+while Jarvis is in hands-free (`--wake`) or panel (`--serve`) mode.
 """
 
 import asyncio
@@ -87,7 +87,7 @@ class SetReminderTool(Tool):
     name = "set_reminder"
     description = (
         "Save a reminder for the user at a given time. The user is asked to confirm first. "
-        "Reminders are recorded and can be listed; Jarvis does not alert the user yet."
+        "Jarvis announces it when it's due while running hands-free or with its panel open."
     )
     args_model = SetReminderArgs
     requires_confirmation = True
@@ -112,10 +112,9 @@ class SetReminderTool(Tool):
         now = self._clock()
         due = parse_when(args.when, now)
         reminder = await asyncio.to_thread(self._store.add, args.text, due, now=now)
-        # TODO(phase-6): a background scheduler that actually notifies when reminders are due.
         return (
             f"Reminder saved: {reminder.text!r} for {_fmt(due)} ({_until(due, now)}). "
-            "Note: Jarvis records reminders but can't alert the user yet; they can ask to list them."
+            "It will be announced when due if Jarvis is running hands-free or with its panel."
         )
 
 
@@ -145,5 +144,6 @@ class ListRemindersTool(Tool):
         now = self._clock()
         lines = [f"{len(reminders)} reminder(s), soonest first (now: {_fmt(now)}):"]
         for i, r in enumerate(reminders, start=1):
-            lines.append(f"{i}. {_fmt(r.due)} ({_until(r.due, now)}): {r.text}")
+            status = "delivered" if r.fired_at else _until(r.due, now)
+            lines.append(f"{i}. {_fmt(r.due)} ({status}): {r.text}")
         return "\n".join(lines)

@@ -116,6 +116,28 @@ def test_ui_port_must_be_a_valid_port(monkeypatch: pytest.MonkeyPatch) -> None:
         _settings()
 
 
+def test_observability_and_reminder_defaults() -> None:
+    settings = _settings()
+    assert settings.metrics_path == Path(".jarvis/metrics.jsonl")
+    assert settings.metrics_enabled is True
+    assert settings.reminder_poll_seconds == 30
+    assert settings.reminder_notify == "tts"
+
+
+def test_reminder_notify_is_normalised_and_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JARVIS_REMINDER_NOTIFY", " Both ")
+    assert _settings().reminder_notify == "both"
+    monkeypatch.setenv("JARVIS_REMINDER_NOTIFY", "email")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_reminder_poll_must_be_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JARVIS_REMINDER_POLL_SECONDS", "0")
+    with pytest.raises(ValidationError):
+        _settings()
+
+
 def test_invalid_numbers_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JARVIS_AGENT_MAX_ITERATIONS", "0")
     with pytest.raises(ValidationError):

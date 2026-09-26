@@ -5,7 +5,7 @@ import json
 import logging
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -115,6 +115,21 @@ class Settings(BaseSettings):
     """Address the panel listens on. Loopback only (127.0.0.1, ::1, localhost): Jarvis
     runs tools and hears the mic, so it must never be reachable from other machines."""
     ui_port: int = Field(default=8000, ge=1, le=65535)
+
+    # Observability + reminders (Phase 6B)
+    metrics_path: Path = Path(".jarvis/metrics.jsonl")
+    """One JSON line per turn: stage latencies, LLM requests and tokens. Local only."""
+    metrics_enabled: bool = True
+    """Write per-turn metrics to `metrics_path`."""
+    reminder_poll_seconds: int = Field(default=30, ge=1)
+    """How often the scheduler (running in --wake / --serve) checks for due reminders."""
+    reminder_notify: Literal["tts", "toast", "both"] = "tts"
+    """How a due reminder is delivered: spoken, a desktop notification, or both."""
+
+    @field_validator("reminder_notify", mode="before")
+    @classmethod
+    def _normalise_notify(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
 
     @field_validator("ui_host")
     @classmethod

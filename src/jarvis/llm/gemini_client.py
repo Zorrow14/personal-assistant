@@ -25,6 +25,7 @@ from jarvis.core.interfaces import (
     LLMResponse,
     Message,
     StopReason,
+    TokenUsage,
     ToolCall,
     ToolSpec,
 )
@@ -133,6 +134,7 @@ class GeminiClient(LLMClient):
         started = time.perf_counter()
         response = await self._generate_with_retry(to_gemini_contents(messages), config)
         result = from_gemini_response(response)
+        usage = result.usage or TokenUsage()
         log.info(
             "llm.complete",
             model=self._model,
@@ -140,6 +142,8 @@ class GeminiClient(LLMClient):
             finish_reason=_finish_reason_name(response),
             tool_calls=len(result.tool_calls),
             latency_ms=round((time.perf_counter() - started) * 1000),
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
         )
         return result
 
@@ -158,7 +162,8 @@ class GeminiClient(LLMClient):
             except genai_errors.APIError as exc:
                 if exc.code not in RETRYABLE_STATUS_CODES or attempt == MAX_ATTEMPTS:
                     raise LLMError(
-                        f"Gemini request failed ({exc.code} {exc.status}): {exc.message}"
+                        f"Gemini request failed ({exc.code} {exc.status}): {exc.message}",
+                        status_code=exc.code,
                     ) from exc
                 delay = BASE_DELAY_SECONDS * 2 ** (attempt - 1)
                 log.warning(
@@ -202,10 +207,13 @@ def to_gemini_contents(messages: Sequence[Message]) -> list[types.Content]:
 
 def from_gemini_response(response: types.GenerateContentResponse) -> LLMResponse:
     """Convert a Gemini response into a neutral `LLMResponse`."""
+    usage = usage_from_gemini(response)
     candidate = response.candidates[0] if response.candidates else None
     if candidate is None:
         blocked = response.prompt_feedback is not None and response.prompt_feedback.block_reason
-        return LLMResponse(text=None, stop_reason="safety" if blocked else "other", raw=response)
+        return LLMResponse(
+            text=None, stop_reason="safety" if blocked else "other", raw=response, usage=usage
+        )
 
     parts = candidate.content.parts if candidate.content and candidate.content.parts else []
     text = "".join(p.text for p in parts if p.text and not p.thought).strip() or None
@@ -222,7 +230,21 @@ def from_gemini_response(response: types.GenerateContentResponse) -> LLMResponse
     if not calls:
         finish = candidate.finish_reason
         stop_reason = _FINISH_REASONS.get(finish, "other") if finish else "other"
-    return LLMResponse(text=text, tool_calls=calls, stop_reason=stop_reason, raw=response)
+    return LLMResponse(
+        text=text, tool_calls=calls, stop_reason=stop_reason, raw=response, usage=usage
+    )
+
+
+def usage_from_gemini(response: types.GenerateContentResponse) -> TokenUsage | None:
+    """Token counts from Gemini's `usage_metadata`, or None if it sent none."""
+    meta = response.usage_metadata
+    if meta is None:
+        return None
+    return TokenUsage(
+        input_tokens=meta.prompt_token_count or 0,
+        output_tokens=meta.candidates_token_count or 0,
+        thinking_tokens=meta.thoughts_token_count or 0,
+    )
 
 
 def _to_content(message: Message) -> types.Content | None:

@@ -1,0 +1,58 @@
+{
+  "description": "Tool-selection regression cases for eval/run.py. expect_tool: the tool the model must call (null = it should answer without tools). expect_contains: text the reply must include (case-insensitive). fake_args / fake_reply: what the scripted LLM does in --fake mode.",
+  "cases": [
+    {
+      "name": "log a task",
+      "input": "Log that I tested the eval harness.",
+      "expect_tool": "write_task_note",
+      "fake_args": {"command": "Test the eval harness", "body": "Ran the eval harness."}
+    },
+    {
+      "name": "search my notes",
+      "input": "Search my notes about the vault module.",
+      "expect_tool": "search_memory",
+      "fake_args": {"query": "vault module"}
+    },
+    {
+      "name": "current time",
+      "input": "What time is it?",
+      "expect_tool": "get_datetime"
+    },
+    {
+      "name": "today's date",
+      "input": "What's today's date?",
+      "expect_tool": "get_datetime"
+    },
+    {
+      "name": "set a reminder",
+      "input": "Remind me to stretch in 10 minutes.",
+      "expect_tool": "set_reminder",
+      "fake_args": {"text": "stretch", "when": "in 10 minutes"}
+    },
+    {
+      "name": "list reminders",
+      "input": "What reminders do I have?",
+      "expect_tool": "list_reminders"
+    },
+    {
+      "name": "read a vault file",
+      "input": "Read Projects/plan.md from my notes and tell me the goal.",
+      "expect_tool": "read_local_file",
+      "expect_contains": "eval",
+      "fake_args": {"path": "Projects/plan.md"},
+      "fake_reply": "The goal is to ship the eval harness this week."
+    },
+    {
+      "name": "web search",
+      "input": "Search the web for the openWakeWord GitHub repository.",
+      "expect_tool": "web_search",
+      "fake_args": {"query": "openWakeWord GitHub repository"}
+    },
+    {
+      "name": "no tool needed",
+      "input": "Just say hi back, in one word.",
+      "expect_tool": null,
+      "fake_reply": "Hi!"
+    }
+  ]
+}
